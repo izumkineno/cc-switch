@@ -32,6 +32,14 @@ import type { ProviderFormProps, ProviderFormValues } from "./ProviderForm";
 import { BasicFormFields } from "./BasicFormFields";
 import { CodexFormFields } from "./CodexFormFields";
 import { ProviderPresetSelector } from "./ProviderPresetSelector";
+import { ProviderRetryPolicyFields } from "./ProviderRetryPolicyFields";
+import {
+  createDefaultProviderRetryPolicyDraft,
+  parseProviderRetryPolicy,
+  providerRetryPolicyToDraft,
+  type ProviderRetryPolicyDraft,
+  type ProviderRetryPolicyErrors,
+} from "@/utils/providerRetryPolicy";
 import {
   grokBuildOfficialPreset,
   grokBuildProviderPresets,
@@ -156,7 +164,14 @@ export function GrokBuildProviderForm({
   const [draftCustomEndpoints, setDraftCustomEndpoints] = useState<string[]>(
     [],
   );
-
+  const [retryPolicyDraft, setRetryPolicyDraft] =
+    useState<ProviderRetryPolicyDraft>(() =>
+      initialData
+        ? providerRetryPolicyToDraft(initialData.meta?.retryPolicy)
+        : createDefaultProviderRetryPolicyDraft(),
+    );
+  const [retryPolicyErrors, setRetryPolicyErrors] =
+    useState<ProviderRetryPolicyErrors>({});
   const form = useForm<ProviderFormData>({
     resolver: zodResolver(providerSchema),
     defaultValues: {
@@ -180,7 +195,12 @@ export function GrokBuildProviderForm({
   useEffect(() => {
     onSubmittingChange?.(isSubmitting);
   }, [isSubmitting, onSubmittingChange]);
-
+  useEffect(() => {
+    setRetryPolicyDraft(
+      providerRetryPolicyToDraft(initialData?.meta?.retryPolicy),
+    );
+    setRetryPolicyErrors({});
+  }, [initialData]);
   // Grok Build 预设已不含 cn_official（国产官方直连无法在 Grok CLI 使用）
   const presetCategoryLabels = useMemo(
     () => ({
@@ -300,9 +320,25 @@ export function GrokBuildProviderForm({
     if (parsed.name) form.setValue("name", parsed.name);
   };
 
-  const handleSubmit = async (values: ProviderFormData) => {
-    const name = values.name.trim();
+  const parseRetryPolicyForSubmit = () => {
+    const result = parseProviderRetryPolicy(retryPolicyDraft);
+    if (!result.success || !result.policy) {
+      setRetryPolicyErrors(result.errors);
+      toast.error(
+        t("providerRetryPolicy.invalid", {
+          defaultValue: "Please correct the supplier retry settings.",
+        }),
+      );
+      return null;
+    }
+    setRetryPolicyErrors({});
+    return result.policy;
+  };
 
+  const handleSubmit = async (values: ProviderFormData) => {
+    const retryPolicy = parseRetryPolicyForSubmit();
+    if (retryPolicy === null) return;
+    const name = values.name.trim();
     // 官方条目：config 快照原样透传（新增时为空），不做自定义模型字段校验，
     // 也不重建 config —— 新增走 ensure seed，编辑只允许改名称/图标等元信息。
     if (category === "official") {
@@ -315,7 +351,10 @@ export function GrokBuildProviderForm({
         presetId: selectedPresetId ?? undefined,
         presetCategory: "official",
         isPartner: false,
-        meta: initialData?.meta,
+        meta: {
+          ...(initialData?.meta ?? {}),
+          retryPolicy,
+        },
       });
       return;
     }
@@ -399,6 +438,7 @@ export function GrokBuildProviderForm({
         Number.isInteger(parsedMaxOutputTokens) && parsedMaxOutputTokens > 0
           ? parsedMaxOutputTokens
           : undefined,
+      retryPolicy,
     };
     if (!providerId && Object.keys(customEndpoints).length > 0) {
       meta.custom_endpoints = customEndpoints;
@@ -540,6 +580,15 @@ export function GrokBuildProviderForm({
             </div>
           </>
         )}
+
+        <ProviderRetryPolicyFields
+          value={retryPolicyDraft}
+          onChange={(value) => {
+            setRetryPolicyDraft(value);
+            setRetryPolicyErrors({});
+          }}
+          errors={retryPolicyErrors}
+        />
 
         <FormField
           control={form.control}

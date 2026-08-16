@@ -6867,6 +6867,20 @@ impl ProviderService {
     }
 
     fn validate_provider_settings(app_type: &AppType, provider: &Provider) -> Result<(), AppError> {
+        if let Some(policy) = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.retry_policy.as_ref())
+        {
+            if let Err(reason) = policy.validate() {
+                return Err(AppError::localized(
+                    "provider.retryPolicy.invalid",
+                    format!("供应商重试策略无效: {reason}"),
+                    format!("Invalid provider retry policy: {reason}"),
+                ));
+            }
+        }
+
         match app_type {
             AppType::Claude => {
                 if !provider.settings_config.is_object() {

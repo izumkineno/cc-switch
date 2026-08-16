@@ -191,6 +191,13 @@ context_window = 250000
           name: "Existing Relay",
           settingsConfig: { config },
           meta: {
+            apiFormat: "openai_chat",
+            retryPolicy: {
+              retryCount: 2,
+              perAttemptTimeoutSeconds: 120,
+              retryWaitSeconds: 5,
+              unlimitedRetries: true,
+            },
             custom_endpoints: {
               "https://deleted.example.com/v1": {
                 url: "https://deleted.example.com/v1",
@@ -209,10 +216,28 @@ context_window = 250000
     expect(
       container.querySelector<HTMLInputElement>("#codexBaseUrl")?.value,
     ).toBe("https://existing.example.com/v1");
-
+    expect(
+      container.querySelector<HTMLInputElement>(
+        "#provider-retry-policy-retryCount",
+      )?.value,
+    ).toBe("2");
+    expect(
+      container
+        .querySelector<HTMLButtonElement>(
+          "#provider-retry-policy-unlimitedRetries",
+        )
+        ?.getAttribute("aria-checked"),
+    ).toBe("true");
     await user.click(screen.getByRole("button", { name: "Save" }));
 
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit.mock.calls[0][0].meta.custom_endpoints).toBeUndefined();
+    expect(onSubmit.mock.calls[0][0].meta.apiFormat).toBe("openai_chat");
+    expect(onSubmit.mock.calls[0][0].meta.retryPolicy).toEqual({
+      retryCount: 2,
+      perAttemptTimeoutSeconds: 120,
+      retryWaitSeconds: 5,
+      unlimitedRetries: true,
+    });
   });
 });

@@ -1490,6 +1490,30 @@
     "pricingModelSourceResponse": "Response model",
     "pricingModelSourceHint": "Choose whether to match pricing by request model or response model"
   },
+  "providerRetryPolicy": {
+    "title": "Supplier retry",
+    "description": "Retry eligible failures against the same supplier before existing failover.",
+    "semantics": "Retry count means retries after the first attempt unless unlimited retries is enabled. Time values are in seconds where shown; zero disables that setting.",
+    "unlimitedRetriesLabel": "Unlimited retries",
+    "unlimitedRetriesHint": "Keep retrying eligible failures until success, a non-retryable error, or cancellation. The retry count is ignored.",
+    "retryCountLabel": "Retries after first attempt",
+    "retryCountHint": "0 disables same-supplier retries; allowed range is {{min}}–{{max}}.",
+    "perAttemptTimeoutLabel": "Per-attempt timeout",
+    "perAttemptTimeoutHint": "0 disables this setting; allowed range is {{min}}–{{max}} seconds.",
+    "retryWaitLabel": "Wait between retries",
+    "retryWaitHint": "0 disables this setting; allowed range is {{min}}–{{max}} seconds.",
+    "seconds": "seconds",
+    "disabledHint": "When unlimited retries is off and all three numeric values are zero, supplier retry is disabled and one initial attempt still runs.",
+    "failoverWarning": "With app failover enabled and unlimited retries off, maximum upstream attempts multiply: (app failover retries + 1) × (supplier retries + 1). Unlimited retries has no finite attempt cap.",
+    "invalid": "Please correct the supplier retry settings.",
+    "errors": {
+      "required": "Enter a value.",
+      "integer": "Enter a non-negative whole number.",
+      "retryCountRange": "Enter a value from {{min}} to {{max}}.",
+      "perAttemptTimeoutSecondsRange": "Enter a value from {{min}} to {{max}} seconds.",
+      "retryWaitSecondsRange": "Enter a value from {{min}} to {{max}} seconds."
+    }
+  },
   "codexConfig": {
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n  \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",

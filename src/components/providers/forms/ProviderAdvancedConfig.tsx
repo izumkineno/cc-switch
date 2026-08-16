@@ -12,6 +12,11 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { ProviderRetryPolicyFields } from "./ProviderRetryPolicyFields";
+import type {
+  ProviderRetryPolicyDraft,
+  ProviderRetryPolicyErrors,
+} from "@/utils/providerRetryPolicy";
 export type PricingModelSourceOption = "inherit" | "request" | "response";
 
 interface ProviderPricingConfig {
@@ -23,11 +28,17 @@ interface ProviderPricingConfig {
 interface ProviderAdvancedConfigProps {
   pricingConfig: ProviderPricingConfig;
   onPricingConfigChange: (config: ProviderPricingConfig) => void;
+  retryPolicy?: ProviderRetryPolicyDraft;
+  onRetryPolicyChange?: (policy: ProviderRetryPolicyDraft) => void;
+  retryPolicyErrors?: ProviderRetryPolicyErrors;
 }
 
 export function ProviderAdvancedConfig({
   pricingConfig,
   onPricingConfigChange,
+  retryPolicy,
+  onRetryPolicyChange,
+  retryPolicyErrors,
 }: ProviderAdvancedConfigProps) {
   const { t } = useTranslation();
   const [isPricingConfigOpen, setIsPricingConfigOpen] = useState(
@@ -177,6 +188,14 @@ export function ProviderAdvancedConfig({
           </div>
         </div>
       </div>
+      {retryPolicy && onRetryPolicyChange && (
+        <ProviderRetryPolicyFields
+          value={retryPolicy}
+          onChange={onRetryPolicyChange}
+          errors={retryPolicyErrors}
+        />
+      )}
     </div>
   );
 }
+

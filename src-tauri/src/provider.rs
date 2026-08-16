@@ -423,6 +423,80 @@ impl LocalProxyRequestOverrides {
     }
 }
 
+/// Supplier-scoped same-provider retry policy.
+///
+/// `retry_count` is the number of retries after the first attempt unless
+/// `unlimited_retries` is enabled. All time values are integer seconds. Zero
+/// disables that part of the policy; an all-zero policy with unlimited retries
+/// disabled is explicitly disabled. Missing fields in a serialized policy
+/// default to zero/false for legacy payload compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProviderRetryPolicy {
+    #[serde(default, rename = "retryCount")]
+    pub retry_count: u32,
+    #[serde(default, rename = "perAttemptTimeoutSeconds")]
+    pub per_attempt_timeout_seconds: u64,
+    #[serde(default, rename = "retryWaitSeconds")]
+    pub retry_wait_seconds: u64,
+    #[serde(default, rename = "unlimitedRetries")]
+    pub unlimited_retries: bool,
+}
+
+impl ProviderRetryPolicy {
+    pub const MAX_RETRY_COUNT: u32 = 10;
+    pub const MAX_PER_ATTEMPT_TIMEOUT_SECONDS: u64 = 1_200;
+    pub const MAX_RETRY_WAIT_SECONDS: u64 = 60;
+
+    pub const fn disabled() -> Self {
+        Self {
+            retry_count: 0,
+            per_attempt_timeout_seconds: 0,
+            retry_wait_seconds: 0,
+            unlimited_retries: false,
+        }
+    }
+
+    /// Normalize a deserialized policy without clamping user input.
+    ///
+    /// Serde defaults missing fields to zero/false, so normalization is
+    /// intentionally a no-op for valid values and maps the disabled
+    /// representation to the canonical disabled policy.
+    pub const fn normalized(self) -> Self {
+        if !self.unlimited_retries
+            && self.retry_count == 0
+            && self.per_attempt_timeout_seconds == 0
+            && self.retry_wait_seconds == 0
+        {
+            Self::disabled()
+        } else {
+            self
+        }
+    }
+
+    /// Whether any provider-specific retry setting is configured.
+    pub const fn enabled(&self) -> bool {
+        self.unlimited_retries
+            || self.retry_count != 0
+            || self.per_attempt_timeout_seconds != 0
+            || self.retry_wait_seconds != 0
+    }
+
+    /// Validate backend payloads strictly; invalid values are rejected rather
+    /// than silently clamped.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.retry_count > Self::MAX_RETRY_COUNT {
+            return Err("retryCount must be between 0 and 10");
+        }
+        if self.per_attempt_timeout_seconds > Self::MAX_PER_ATTEMPT_TIMEOUT_SECONDS {
+            return Err("perAttemptTimeoutSeconds must be between 0 and 1200");
+        }
+        if self.retry_wait_seconds > Self::MAX_RETRY_WAIT_SECONDS {
+            return Err("retryWaitSeconds must be between 0 and 60");
+        }
+        Ok(())
+    }
+}
+
 /// 供应商元数据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderMeta {
@@ -534,6 +608,9 @@ pub struct ProviderMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub local_proxy_request_overrides: Option<LocalProxyRequestOverrides>,
+    /// Supplier-scoped same-provider retry policy. Legacy metadata may omit it.
+    #[serde(rename = "retryPolicy", skip_serializing_if = "Option::is_none")]
+    pub retry_policy: Option<ProviderRetryPolicy>,
     /// 累加模式应用中，该 provider 是否已写入 live config。
     /// `None` 表示旧数据/未知状态，`Some(false)` 表示明确仅存在于数据库中。
     #[serde(rename = "liveConfigManaged", skip_serializing_if = "Option::is_none")]
@@ -546,6 +623,9 @@ pub struct ProviderMeta {
     /// 用于多账号支持，关联到特定的 GitHub 账号
     #[serde(rename = "githubAccountId", skip_serializing_if = "Option::is_none")]
     pub github_account_id: Option<String>,
+    /// Preserve metadata fields unknown to this version across load/save cycles.
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
 }
 
 /// 解析 Provider 级自定义 User-Agent 字符串（单一真理来源）。
@@ -573,6 +653,13 @@ pub fn parse_custom_user_agent(
 }
 
 impl ProviderMeta {
+    /// Return the provider policy, treating missing legacy metadata as disabled.
+    pub fn normalized_retry_policy(&self) -> ProviderRetryPolicy {
+        self.retry_policy
+            .unwrap_or_else(ProviderRetryPolicy::disabled)
+            .normalized()
+    }
+
     /// Codex OAuth FAST mode 是否启用。默认关闭，因为 `service_tier="priority"`
     /// 会按更高速率消耗 ChatGPT 订阅配额，用户需显式开启以换取更低延迟。
     pub fn codex_fast_mode_enabled(&self) -> bool {
@@ -919,9 +1006,6 @@ requires_openai_auth = true"#
 pub struct OpenCodeProviderConfig {
     /// AI SDK 包名，如 "@ai-sdk/openai-compatible", "@ai-sdk/anthropic"
     pub npm: String,
-
-    /// 供应商名称（可选，用于显示）
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
     /// 供应商选项（API 密钥、基础 URL 等）
@@ -1001,7 +1085,8 @@ pub struct OpenCodeModelLimit {
 mod tests {
     use super::{
         ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, LocalProxyRequestOverrides,
-        OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta, UniversalProvider,
+        OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta, ProviderRetryPolicy,
+        UniversalProvider,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1081,6 +1166,100 @@ mod tests {
         let overrides = decoded.local_proxy_request_overrides.unwrap();
         assert_eq!(overrides.headers.get("X-Test"), Some(&"yes".to_string()));
         assert_eq!(overrides.body.unwrap()["temperature"], 0.2);
+    }
+
+    #[test]
+    fn provider_retry_policy_defaults_missing_and_zero_to_disabled() {
+        let missing: ProviderMeta =
+            serde_json::from_value(json!({})).expect("missing policy should deserialize");
+        assert_eq!(
+            missing.normalized_retry_policy(),
+            ProviderRetryPolicy::disabled()
+        );
+        assert!(!missing.normalized_retry_policy().enabled());
+
+        let explicit_zero: ProviderMeta = serde_json::from_value(json!({
+            "retryPolicy": {
+                "retryCount": 0,
+                "perAttemptTimeoutSeconds": 0,
+                "retryWaitSeconds": 0
+            }
+        }))
+        .expect("zero policy should deserialize");
+        assert_eq!(
+            explicit_zero.normalized_retry_policy(),
+            ProviderRetryPolicy::disabled()
+        );
+        assert!(explicit_zero.retry_policy.is_some());
+        let unlimited: ProviderMeta = serde_json::from_value(json!({
+            "retryPolicy": {
+                "unlimitedRetries": true
+            }
+        }))
+        .expect("unlimited policy should deserialize");
+        assert!(unlimited.normalized_retry_policy().unlimited_retries);
+        assert!(unlimited.normalized_retry_policy().enabled());
+    }
+
+    #[test]
+    fn provider_retry_policy_roundtrips_boundaries_and_unknown_metadata() {
+        let meta: ProviderMeta = serde_json::from_value(json!({
+            "retryPolicy": {
+                "retryCount": 10,
+                "perAttemptTimeoutSeconds": 1200,
+                "retryWaitSeconds": 60
+            },
+            "futureMetadata": { "enabled": true }
+        }))
+        .expect("boundary policy should deserialize");
+
+        let policy = meta.retry_policy.expect("policy should be present");
+        assert_eq!(policy.retry_count, 10);
+        assert_eq!(policy.per_attempt_timeout_seconds, 1200);
+        assert_eq!(policy.retry_wait_seconds, 60);
+        assert!(policy.validate().is_ok());
+        assert!(meta.extra.contains_key("futureMetadata"));
+
+        let serialized = serde_json::to_value(&meta).expect("serialize metadata");
+        assert_eq!(serialized["retryPolicy"]["retryCount"], 10);
+        assert_eq!(serialized["retryPolicy"]["perAttemptTimeoutSeconds"], 1200);
+        assert_eq!(serialized["retryPolicy"]["retryWaitSeconds"], 60);
+        assert_eq!(serialized["retryPolicy"]["unlimitedRetries"], false);
+        assert_eq!(serialized["futureMetadata"]["enabled"], true);
+    }
+
+    #[test]
+    fn provider_retry_policy_rejects_invalid_ranges_and_wire_types() {
+        let mut policy = ProviderRetryPolicy {
+            retry_count: 11,
+            ..ProviderRetryPolicy::default()
+        };
+        assert!(policy.validate().is_err());
+
+        policy = ProviderRetryPolicy {
+            per_attempt_timeout_seconds: 1201,
+            ..ProviderRetryPolicy::default()
+        };
+        assert!(policy.validate().is_err());
+
+        policy = ProviderRetryPolicy {
+            retry_wait_seconds: 61,
+            ..ProviderRetryPolicy::default()
+        };
+        assert!(policy.validate().is_err());
+
+        assert!(serde_json::from_value::<ProviderRetryPolicy>(json!({
+            "retryCount": -1,
+            "perAttemptTimeoutSeconds": 0,
+            "retryWaitSeconds": 0
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ProviderRetryPolicy>(json!({
+            "retryCount": "2",
+            "perAttemptTimeoutSeconds": 0,
+            "retryWaitSeconds": 0
+        }))
+        .is_err());
     }
 
     #[test]

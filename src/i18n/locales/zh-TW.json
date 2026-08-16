@@ -1491,6 +1491,30 @@
     "pricingModelSourceResponse": "回傳模型",
     "pricingModelSourceHint": "選擇依請求模型還是回傳模型進行定價比對"
   },
+  "providerRetryPolicy": {
+    "title": "供應商重試",
+    "description": "在現有故障轉移之前，對同一供應商的可重試失敗進行重試。",
+    "semantics": "重試次數表示首次嘗試之後的重試次數；啟用無限重試後將忽略該次數。標示秒數的時間值均以秒為單位；0 表示停用該設定。",
+    "unlimitedRetriesLabel": "無限重試",
+    "unlimitedRetriesHint": "持續重試可重試的失敗，直到成功、遇到不可重試錯誤或要求被取消。啟用後將忽略重試次數。",
+    "retryCountLabel": "首次嘗試後的重試次數",
+    "retryCountHint": "0 表示停用同一供應商重試；允許範圍為 {{min}}–{{max}}。",
+    "perAttemptTimeoutLabel": "單次嘗試逾時",
+    "perAttemptTimeoutHint": "0 表示停用此設定；允許範圍為 {{min}}–{{max}} 秒。",
+    "retryWaitLabel": "重試間隔",
+    "retryWaitHint": "0 表示停用此設定；允許範圍為 {{min}}–{{max}} 秒。",
+    "seconds": "秒",
+    "disabledHint": "關閉無限重試且三個數字均為 0 時，供應商重試停用，但仍會執行一次初始嘗試。",
+    "failoverWarning": "啟用應用程式故障轉移且關閉無限重試時，上游最大嘗試次數會相乘：（應用程式故障轉移重試次數 + 1）×（供應商重試次數 + 1）。啟用無限重試後沒有有限的嘗試次數上限。",
+    "invalid": "請修正供應商重試設定。",
+    "errors": {
+      "required": "請輸入值。",
+      "integer": "請輸入非負整數。",
+      "retryCountRange": "請輸入 {{min}} 到 {{max}} 之間的值。",
+      "perAttemptTimeoutSecondsRange": "請輸入 {{min}} 到 {{max}} 秒之間的值。",
+      "retryWaitSecondsRange": "請輸入 {{min}} 到 {{max}} 秒之間的值。"
+    }
+  },
   "codexConfig": {
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n    \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",

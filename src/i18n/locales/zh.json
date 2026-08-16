@@ -1490,6 +1490,30 @@
     "pricingModelSourceResponse": "返回模型",
     "pricingModelSourceHint": "选择按请求模型还是返回模型进行定价匹配"
   },
+  "providerRetryPolicy": {
+    "title": "供应商重试",
+    "description": "在现有故障转移之前，对同一供应商的可重试失败进行重试。",
+    "semantics": "重试次数表示首次尝试之后的重试次数；启用无限重试后将忽略该次数。标注秒数的时间值均以秒为单位；0 表示停用该设置。",
+    "unlimitedRetriesLabel": "无限重试",
+    "unlimitedRetriesHint": "持续重试可重试的失败，直到成功、遇到不可重试错误或请求被取消。启用后将忽略重试次数。",
+    "retryCountLabel": "首次尝试后的重试次数",
+    "retryCountHint": "0 表示停用同一供应商重试；允许范围为 {{min}}–{{max}}。",
+    "perAttemptTimeoutLabel": "单次尝试超时",
+    "perAttemptTimeoutHint": "0 表示停用此设置；允许范围为 {{min}}–{{max}} 秒。",
+    "retryWaitLabel": "重试间隔",
+    "retryWaitHint": "0 表示停用此设置；允许范围为 {{min}}–{{max}} 秒。",
+    "seconds": "秒",
+    "disabledHint": "关闭无限重试且三个数字均为 0 时，供应商重试停用，但仍会执行一次初始尝试。",
+    "failoverWarning": "启用应用故障转移且关闭无限重试时，上游最大尝试次数会相乘：（应用故障转移重试次数 + 1）×（供应商重试次数 + 1）。启用无限重试后没有有限的尝试次数上限。",
+    "invalid": "请修正供应商重试设置。",
+    "errors": {
+      "required": "请输入值。",
+      "integer": "请输入非负整数。",
+      "retryCountRange": "请输入 {{min}} 到 {{max}} 之间的值。",
+      "perAttemptTimeoutSecondsRange": "请输入 {{min}} 到 {{max}} 秒之间的值。",
+      "retryWaitSecondsRange": "请输入 {{min}} 到 {{max}} 秒之间的值。"
+    }
+  },
   "codexConfig": {
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n  \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",

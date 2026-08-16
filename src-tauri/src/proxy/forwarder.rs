@@ -27,7 +27,7 @@ use crate::proxy::providers::copilot_auth::CopilotAuthManager;
 use crate::proxy::providers::xai_oauth_auth::XaiOAuthManager;
 use crate::{
     app_config::AppType,
-    provider::{LocalProxyRequestOverrides, Provider},
+    provider::{LocalProxyRequestOverrides, Provider, ProviderRetryPolicy},
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -134,6 +134,148 @@ impl Drop for ActiveConnectionGuard {
         }
         // 没有 runtime 时静默丢失计数（仅 UI 展示用，可接受最终一致性）
     }
+}
+#[derive(Debug, Clone, Default)]
+struct ProviderExecutionPin {
+    /// Resolved once at SlotStart and reused by ordinary and repair sends.
+    base_url: Option<String>,
+    /// Managed/static credentials are resolved once for the provider slot.
+    auth: Option<AuthInfo>,
+    /// `None` is a valid result for providers that do not require auth, so
+    /// keep an explicit resolution bit instead of resolving on every retry.
+    auth_resolved: bool,
+    /// Codex OAuth's selected managed account is part of the pinned auth
+    /// context. The manager's default account must not change mid-slot.
+    codex_oauth_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderSlotState {
+    SlotStart,
+    OrdinaryAttempt(usize),
+    Complete,
+    Retryable,
+    RepairNeeded,
+}
+
+struct ProviderAttemptPermit {
+    router: Arc<ProviderRouter>,
+    provider_id: String,
+    app_type: String,
+    used_half_open_permit: bool,
+    finalized: bool,
+    finalizing: bool,
+}
+
+impl ProviderAttemptPermit {
+    fn new(
+        router: Arc<ProviderRouter>,
+        provider_id: &str,
+        app_type: &str,
+        used_half_open_permit: bool,
+    ) -> Self {
+        Self {
+            router,
+            provider_id: provider_id.to_string(),
+            app_type: app_type.to_string(),
+            used_half_open_permit,
+            finalized: false,
+            finalizing: false,
+        }
+    }
+
+    async fn record_success(&mut self, forwarder: &RequestForwarder) {
+        if self.finalized || self.finalizing {
+            return;
+        }
+        self.finalizing = true;
+        forwarder
+            .record_success_result(
+                &self.provider_id,
+                &self.app_type,
+                self.used_half_open_permit,
+            )
+            .await;
+        self.finalizing = false;
+        self.finalized = true;
+    }
+
+    async fn record_failure(&mut self, error: &ProxyError) {
+        if self.finalized || self.finalizing {
+            return;
+        }
+        self.finalizing = true;
+        let _ = self
+            .router
+            .record_result(
+                &self.provider_id,
+                &self.app_type,
+                self.used_half_open_permit,
+                false,
+                Some(error.to_string()),
+            )
+            .await;
+        self.finalizing = false;
+        self.finalized = true;
+    }
+
+    async fn release_neutral(&mut self) {
+        if self.finalized || self.finalizing {
+            return;
+        }
+        self.finalizing = true;
+        self.router
+            .release_permit_neutral(
+                &self.provider_id,
+                &self.app_type,
+                self.used_half_open_permit,
+            )
+            .await;
+        self.finalizing = false;
+        self.finalized = true;
+    }
+}
+
+impl Drop for ProviderAttemptPermit {
+    fn drop(&mut self) {
+        if self.finalized || !self.used_half_open_permit {
+            return;
+        }
+        let router = self.router.clone();
+        let provider_id = self.provider_id.clone();
+        let app_type = self.app_type.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                router
+                    .release_permit_neutral(&provider_id, &app_type, true)
+                    .await;
+            });
+        }
+    }
+}
+
+struct ProviderSlotFailure {
+    error: ProxyError,
+    /// Repair failures that are client/config errors retain the existing
+    /// one-shot repair behavior and must not enter cross-provider failover.
+    allow_failover: bool,
+}
+
+struct ProviderForwardedResponse {
+    response: ProxyResponse,
+    claude_api_format: Option<String>,
+    outbound_model: Option<String>,
+}
+enum ProviderRepairOutcome {
+    NotNeeded,
+    Success(ProviderForwardedResponse),
+    Failed {
+        error: ProxyError,
+        allow_failover: bool,
+    },
+    FailedOriginal {
+        allow_failover: bool,
+    },
 }
 
 pub struct RequestForwarder {
@@ -296,70 +438,6 @@ impl RequestForwarder {
         });
     }
 
-    /// 整流（thinking signature 或 budget）重试失败后的统一收尾。
-    ///
-    /// `None` 表示已记录熔断器、累积 `last_error`/`last_provider`，
-    /// 调用方应 `continue` 让下一家 provider 继续故障转移；
-    /// `Some(ForwardError)` 表示是客户端错误，没有 provider 能修复，
-    /// 调用方应直接 `return` 把错误返回给客户端。
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_rectifier_retry_failure(
-        &self,
-        retry_err: ProxyError,
-        provider: &Provider,
-        app_type_str: &str,
-        used_half_open_permit: bool,
-        rectifier_label: &str,
-        last_error: &mut Option<ProxyError>,
-        last_provider: &mut Option<Provider>,
-    ) -> Option<ForwardError> {
-        // Provider 错误：本家上游/网络确实出问题，下一家 provider 可能可用 → 继续故障转移。
-        // 客户端错误：整流后请求仍违法，下一家也修不好 → 直接返回。
-        let is_provider_error = match &retry_err {
-            ProxyError::Timeout(_) | ProxyError::ForwardFailed(_) => true,
-            ProxyError::UpstreamError { status, .. } => *status >= 500,
-            _ => false,
-        };
-
-        if is_provider_error {
-            let _ = self
-                .router
-                .record_result(
-                    &provider.id,
-                    app_type_str,
-                    used_half_open_permit,
-                    false,
-                    Some(retry_err.to_string()),
-                )
-                .await;
-            {
-                let mut status = self.status.write().await;
-                status.last_error = Some(format!(
-                    "Provider {} {rectifier_label}重试失败: {}",
-                    provider.name, retry_err
-                ));
-            }
-            *last_error = Some(retry_err);
-            *last_provider = Some(provider.clone());
-            return None;
-        }
-
-        self.router
-            .release_permit_neutral(&provider.id, app_type_str, used_half_open_permit)
-            .await;
-        let mut status = self.status.write().await;
-        status.failed_requests += 1;
-        status.last_error = Some(retry_err.to_string());
-        if status.total_requests > 0 {
-            status.success_rate =
-                (status.success_requests as f32 / status.total_requests as f32) * 100.0;
-        }
-        Some(ForwardError {
-            error: retry_err,
-            provider: Some(provider.clone()),
-        })
-    }
-
     /// 转发请求（带故障转移）
     ///
     /// 这是 thin wrapper：在客户端请求维度记一次 `total_requests` / 调整
@@ -399,13 +477,8 @@ impl RequestForwarder {
 
     /// 实际转发逻辑（不包含客户端维度的入口/出口计数）
     ///
-    /// # Arguments
-    /// * `app_type` - 应用类型
-    /// * `method` - 客户端请求的 HTTP 方法（透传给上游，支持 GET/POST 等）
-    /// * `endpoint` - API 端点
-    /// * `body` - 请求体
-    /// * `headers` - 请求头
-    /// * `providers` - 已选择的 Provider 列表（由 RequestContext 提供，避免重复调用 select_providers）
+    /// ProviderRouter 仍只负责在请求开始时选择并排序 providers；同一 provider
+    /// 的 policy loop 在这里运行，不会重新选择 provider。
     #[allow(clippy::too_many_arguments)]
     async fn forward_with_retry_inner(
         &self,
@@ -417,7 +490,6 @@ impl RequestForwarder {
         extensions: Extensions,
         providers: Vec<Provider>,
     ) -> Result<ForwardResult, ForwardError> {
-        // 获取适配器
         let adapter = get_adapter(app_type).ok_or_else(|| ForwardError {
             error: ProxyError::ConfigError(format!(
                 "{} does not support proxy routing",
@@ -437,20 +509,9 @@ impl RequestForwarder {
         let mut last_error = None;
         let mut last_provider = None;
         let mut attempted_providers = 0usize;
-
-        // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）
         let bypass_circuit_breaker = providers.len() == 1;
 
-        // 依次尝试每个供应商
-        for provider in providers.iter() {
-            // 整流器重试标记：每个 provider 独立持有，避免标记跨 provider 短路故障转移
-            // —— 首家 provider 整流后被 5xx/timeout 击落时，下家仍能用整流后的请求体走整流流程
-            let mut rectifier_retried = false;
-            let mut budget_rectifier_retried = false;
-            let mut media_rectifier_retried = false;
-
-            // 上限检查：尊重用户在 AppProxyConfig.max_retries 上配置的「重试次数」。
-            // 放在熔断器 allow 检查之前，避免在已经超限时还占用 HalfOpen 探测名额。
+        for provider in &providers {
             if attempted_providers >= self.max_attempts {
                 log::warn!(
                     "[{app_type_str}] 已达最大尝试次数上限 ({}/{}), 停止故障转移",
@@ -460,8 +521,6 @@ impl RequestForwarder {
                 break;
             }
 
-            // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
-            // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
             let (allowed, used_half_open_permit) = if bypass_circuit_breaker {
                 (true, false)
             } else {
@@ -471,61 +530,49 @@ impl RequestForwarder {
                     .await;
                 (permit.allowed, permit.used_half_open_permit)
             };
-
             if !allowed {
                 continue;
             }
 
-            // PRE-SEND 优化器：每个 provider 独立决定是否优化
-            // clone body 以避免 Bedrock 优化字段泄漏到非 Bedrock provider（failover 场景）
-            let mut provider_body =
-                if self.optimizer_config.enabled && is_bedrock_provider(provider) {
-                    let mut b = body.clone();
-                    if self.optimizer_config.thinking_optimizer {
-                        super::thinking_optimizer::optimize(&mut b, &self.optimizer_config);
-                    }
-                    if self.optimizer_config.cache_injection {
-                        super::cache_injector::inject(&mut b, &self.optimizer_config);
-                    }
-                    b
-                } else {
-                    body.clone()
-                };
-
             attempted_providers += 1;
-
-            // 更新状态中的当前 Provider 信息（per-attempt 维度的标识）
-            //
-            // total_requests / last_request_at / active_connections 已由
-            // forward_with_retry wrapper 在客户端请求维度统一处理，这里只刷
-            // 新「正在尝试哪个 provider」的展示字段。
             {
                 let mut status = self.status.write().await;
                 status.current_provider = Some(provider.name.clone());
                 status.current_provider_id = Some(provider.id.clone());
             }
 
-            // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
+            let retry_policy = if app_type.supports_local_proxy() {
+                provider
+                    .meta
+                    .as_ref()
+                    .map(|meta| meta.normalized_retry_policy())
+                    .unwrap_or_else(ProviderRetryPolicy::disabled)
+            } else {
+                ProviderRetryPolicy::disabled()
+            };
+            let mut permit = ProviderAttemptPermit::new(
+                self.router.clone(),
+                &provider.id,
+                app_type_str,
+                used_half_open_permit,
+            );
+
             match self
-                .forward(
+                .execute_provider_slot(
                     app_type,
-                    &method,
-                    provider,
+                    method.clone(),
                     endpoint,
-                    &provider_body,
+                    &body,
                     &headers,
                     &extensions,
+                    provider,
                     adapter.as_ref(),
+                    retry_policy,
+                    &mut permit,
                 )
                 .await
             {
-                Ok((response, claude_api_format, outbound_model)) => {
-                    // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
-                    // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
-                    self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
-                        .await;
-
-                    // 更新当前应用类型使用的 provider
+                Ok(forwarded) => {
                     {
                         let mut current_providers = self.current_providers.write().await;
                         current_providers.insert(
@@ -534,561 +581,89 @@ impl RequestForwarder {
                         );
                     }
 
-                    // 更新成功统计
+                    let should_switch =
+                        self.current_provider_id_at_start.as_str() != provider.id.as_str();
                     {
                         let mut status = self.status.write().await;
                         status.success_requests += 1;
                         status.last_error = None;
-                        let should_switch =
-                            self.current_provider_id_at_start.as_str() != provider.id.as_str();
                         if should_switch {
                             status.failover_count += 1;
-
-                            // 异步触发供应商切换，更新 UI/托盘，并把“当前供应商”同步为实际使用的 provider
-                            let fm = self.failover_manager.clone();
-                            let ah = self.app_handle.clone();
-                            let pid = provider.id.clone();
-                            let pname = provider.name.clone();
-                            let at = app_type_str.to_string();
-
-                            tokio::spawn(async move {
-                                let _ = fm.try_switch(ah.as_ref(), &at, &pid, &pname).await;
-                            });
                         }
-                        // 重新计算成功率
                         if status.total_requests > 0 {
                             status.success_rate = (status.success_requests as f32
                                 / status.total_requests as f32)
                                 * 100.0;
                         }
                     }
+                    if should_switch {
+                        let fm = self.failover_manager.clone();
+                        let ah = self.app_handle.clone();
+                        let pid = provider.id.clone();
+                        let pname = provider.name.clone();
+                        let at = app_type_str.to_string();
+                        tokio::spawn(async move {
+                            let _ = fm.try_switch(ah.as_ref(), &at, &pid, &pname).await;
+                        });
+                    }
 
                     return Ok(ForwardResult {
-                        response,
+                        response: forwarded.response,
                         provider: provider.clone(),
-                        claude_api_format,
-                        outbound_model,
+                        claude_api_format: forwarded.claude_api_format,
+                        outbound_model: forwarded.outbound_model,
                         connection_guard: None,
                     });
                 }
-                Err(e) => {
-                    // 检测是否需要触发整流器（仅 Claude/ClaudeAuth 供应商）
-                    let provider_type = ProviderType::from_app_type_and_config(app_type, provider);
-                    let is_anthropic_provider = matches!(
-                        provider_type,
-                        Some(ProviderType::Claude | ProviderType::ClaudeAuth)
-                    );
-                    let mut signature_rectifier_non_retryable_client_error = false;
-
-                    if self.media_retry_should_trigger(
-                        adapter.name(),
-                        media_rectifier_retried,
-                        &provider_body,
-                        &e,
-                    ) {
-                        let mut media_body = provider_body.clone();
-                        let replaced_images =
-                            super::media_sanitizer::replace_image_blocks_with_marker(
-                                &mut media_body,
-                            );
-
-                        if replaced_images > 0 {
-                            let _ = std::mem::replace(&mut media_rectifier_retried, true);
-                            let model = media_body
-                                .get("model")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            log::info!(
-                                "[{app_type_str}] [Media] Upstream rejected image input; retrying provider={} model={} with {replaced_images} image block(s) replaced by {}",
-                                provider.id,
-                                model,
-                                super::media_sanitizer::UNSUPPORTED_IMAGE_MARKER
-                            );
-
-                            match self
-                                .forward(
-                                    app_type,
-                                    &method,
-                                    provider,
-                                    endpoint,
-                                    &media_body,
-                                    &headers,
-                                    &extensions,
-                                    adapter.as_ref(),
-                                )
-                                .await
-                            {
-                                Ok((response, claude_api_format, outbound_model)) => {
-                                    log::info!(
-                                        "[{app_type_str}] [Media] Unsupported-image retry succeeded"
-                                    );
-                                    self.record_success_result(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
-
-                                    {
-                                        let mut current_providers =
-                                            self.current_providers.write().await;
-                                        current_providers.insert(
-                                            app_type_str.to_string(),
-                                            (provider.id.clone(), provider.name.clone()),
-                                        );
-                                    }
-
-                                    {
-                                        let mut status = self.status.write().await;
-                                        status.success_requests += 1;
-                                        status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
-                                                != provider.id.as_str();
-                                        if should_switch {
-                                            status.failover_count += 1;
-                                            let fm = self.failover_manager.clone();
-                                            let ah = self.app_handle.clone();
-                                            let pid = provider.id.clone();
-                                            let pname = provider.name.clone();
-                                            let at = app_type_str.to_string();
-
-                                            tokio::spawn(async move {
-                                                let _ = fm
-                                                    .try_switch(ah.as_ref(), &at, &pid, &pname)
-                                                    .await;
-                                            });
-                                        }
-                                        if status.total_requests > 0 {
-                                            status.success_rate = (status.success_requests as f32
-                                                / status.total_requests as f32)
-                                                * 100.0;
-                                        }
-                                    }
-
-                                    return Ok(ForwardResult {
-                                        response,
-                                        provider: provider.clone(),
-                                        claude_api_format,
-                                        outbound_model,
-                                        connection_guard: None,
-                                    });
-                                }
-                                Err(retry_err) => {
-                                    log::warn!(
-                                        "[{app_type_str}] [Media] Unsupported-image retry still failed: {retry_err}"
-                                    );
-                                    if let Some(err) = self
-                                        .handle_rectifier_retry_failure(
-                                            retry_err,
-                                            provider,
-                                            app_type_str,
-                                            used_half_open_permit,
-                                            "media 降级",
-                                            &mut last_error,
-                                            &mut last_provider,
-                                        )
-                                        .await
-                                    {
-                                        return Err(err);
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-
-                    if is_anthropic_provider {
-                        let error_message = extract_error_message(&e);
-                        if should_rectify_thinking_signature(
-                            error_message.as_deref(),
-                            &self.rectifier_config,
-                        ) {
-                            // 已经重试过：直接返回错误（不可重试客户端错误）
-                            if rectifier_retried {
-                                log::warn!("[{app_type_str}] [RECT-005] 整流器已触发过，不再重试");
-                                // 释放 HalfOpen permit（不记录熔断器，这是客户端兼容性问题）
-                                self.router
-                                    .release_permit_neutral(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
-                                let mut status = self.status.write().await;
-                                status.failed_requests += 1;
-                                status.last_error = Some(e.to_string());
-                                if status.total_requests > 0 {
-                                    status.success_rate = (status.success_requests as f32
-                                        / status.total_requests as f32)
-                                        * 100.0;
-                                }
-                                return Err(ForwardError {
-                                    error: e,
-                                    provider: Some(provider.clone()),
-                                });
-                            }
-
-                            // 首次触发：整流请求体
-                            let rectified = rectify_anthropic_request(&mut provider_body);
-
-                            // 整流未生效：继续尝试 budget 整流路径，避免误判后短路
-                            if !rectified.applied {
-                                log::warn!(
-                                    "[{app_type_str}] [RECT-006] thinking 签名整流器触发但无可整流内容，继续检查 budget；若 budget 也未命中则按客户端错误返回"
-                                );
-                                signature_rectifier_non_retryable_client_error = true;
-                            } else {
-                                log::info!(
-                                    "[{}] [RECT-001] thinking 签名整流器触发, 移除 {} thinking blocks, {} redacted_thinking blocks, {} signature fields",
-                                    app_type_str,
-                                    rectified.removed_thinking_blocks,
-                                    rectified.removed_redacted_thinking_blocks,
-                                    rectified.removed_signature_fields
-                                );
-
-                                // 标记已重试（当前逻辑下重试后必定 return，保留标记以备将来扩展）
-                                let _ = std::mem::replace(&mut rectifier_retried, true);
-
-                                // 使用同一供应商重试（不计入熔断器）
-                                match self
-                                    .forward(
-                                        app_type,
-                                        &method,
-                                        provider,
-                                        endpoint,
-                                        &provider_body,
-                                        &headers,
-                                        &extensions,
-                                        adapter.as_ref(),
-                                    )
-                                    .await
-                                {
-                                    Ok((response, claude_api_format, outbound_model)) => {
-                                        log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
-                                        self.record_success_result(
-                                            &provider.id,
-                                            app_type_str,
-                                            used_half_open_permit,
-                                        )
-                                        .await;
-
-                                        // 更新当前应用类型使用的 provider
-                                        {
-                                            let mut current_providers =
-                                                self.current_providers.write().await;
-                                            current_providers.insert(
-                                                app_type_str.to_string(),
-                                                (provider.id.clone(), provider.name.clone()),
-                                            );
-                                        }
-
-                                        // 更新成功统计
-                                        {
-                                            let mut status = self.status.write().await;
-                                            status.success_requests += 1;
-                                            status.last_error = None;
-                                            let should_switch =
-                                                self.current_provider_id_at_start.as_str()
-                                                    != provider.id.as_str();
-                                            if should_switch {
-                                                status.failover_count += 1;
-
-                                                // 异步触发供应商切换，更新 UI/托盘
-                                                let fm = self.failover_manager.clone();
-                                                let ah = self.app_handle.clone();
-                                                let pid = provider.id.clone();
-                                                let pname = provider.name.clone();
-                                                let at = app_type_str.to_string();
-
-                                                tokio::spawn(async move {
-                                                    let _ = fm
-                                                        .try_switch(ah.as_ref(), &at, &pid, &pname)
-                                                        .await;
-                                                });
-                                            }
-                                            if status.total_requests > 0 {
-                                                status.success_rate = (status.success_requests
-                                                    as f32
-                                                    / status.total_requests as f32)
-                                                    * 100.0;
-                                            }
-                                        }
-
-                                        return Ok(ForwardResult {
-                                            response,
-                                            provider: provider.clone(),
-                                            claude_api_format,
-                                            outbound_model,
-                                            connection_guard: None,
-                                        });
-                                    }
-                                    Err(retry_err) => {
-                                        log::warn!(
-                                            "[{app_type_str}] [RECT-003] 整流重试仍失败: {retry_err}"
-                                        );
-                                        if let Some(err) = self
-                                            .handle_rectifier_retry_failure(
-                                                retry_err,
-                                                provider,
-                                                app_type_str,
-                                                used_half_open_permit,
-                                                "整流",
-                                                &mut last_error,
-                                                &mut last_provider,
-                                            )
-                                            .await
-                                        {
-                                            return Err(err);
-                                        }
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // 检测是否需要触发 budget 整流器（仅 Claude/ClaudeAuth 供应商）
-                    if is_anthropic_provider {
-                        let error_message = extract_error_message(&e);
-                        if should_rectify_thinking_budget(
-                            error_message.as_deref(),
-                            &self.rectifier_config,
-                        ) {
-                            // 已经重试过：直接返回错误（不可重试客户端错误）
-                            if budget_rectifier_retried {
-                                log::warn!(
-                                    "[{app_type_str}] [RECT-013] budget 整流器已触发过，不再重试"
-                                );
-                                self.router
-                                    .release_permit_neutral(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
-                                let mut status = self.status.write().await;
-                                status.failed_requests += 1;
-                                status.last_error = Some(e.to_string());
-                                if status.total_requests > 0 {
-                                    status.success_rate = (status.success_requests as f32
-                                        / status.total_requests as f32)
-                                        * 100.0;
-                                }
-                                return Err(ForwardError {
-                                    error: e,
-                                    provider: Some(provider.clone()),
-                                });
-                            }
-
-                            let budget_rectified = rectify_thinking_budget(&mut provider_body);
-                            if !budget_rectified.applied {
-                                log::warn!(
-                                    "[{app_type_str}] [RECT-014] budget 整流器触发但无可整流内容，不做无意义重试"
-                                );
-                                self.router
-                                    .release_permit_neutral(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
-                                let mut status = self.status.write().await;
-                                status.failed_requests += 1;
-                                status.last_error = Some(e.to_string());
-                                if status.total_requests > 0 {
-                                    status.success_rate = (status.success_requests as f32
-                                        / status.total_requests as f32)
-                                        * 100.0;
-                                }
-                                return Err(ForwardError {
-                                    error: e,
-                                    provider: Some(provider.clone()),
-                                });
-                            }
-
-                            log::info!(
-                                "[{}] [RECT-010] thinking budget 整流器触发, before={:?}, after={:?}",
-                                app_type_str,
-                                budget_rectified.before,
-                                budget_rectified.after
-                            );
-
-                            let _ = std::mem::replace(&mut budget_rectifier_retried, true);
-
-                            // 使用同一供应商重试（不计入熔断器）
-                            match self
-                                .forward(
-                                    app_type,
-                                    &method,
-                                    provider,
-                                    endpoint,
-                                    &provider_body,
-                                    &headers,
-                                    &extensions,
-                                    adapter.as_ref(),
-                                )
-                                .await
-                            {
-                                Ok((response, claude_api_format, outbound_model)) => {
-                                    log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
-                                    self.record_success_result(
-                                        &provider.id,
-                                        app_type_str,
-                                        used_half_open_permit,
-                                    )
-                                    .await;
-
-                                    {
-                                        let mut current_providers =
-                                            self.current_providers.write().await;
-                                        current_providers.insert(
-                                            app_type_str.to_string(),
-                                            (provider.id.clone(), provider.name.clone()),
-                                        );
-                                    }
-
-                                    {
-                                        let mut status = self.status.write().await;
-                                        status.success_requests += 1;
-                                        status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
-                                                != provider.id.as_str();
-                                        if should_switch {
-                                            status.failover_count += 1;
-                                            let fm = self.failover_manager.clone();
-                                            let ah = self.app_handle.clone();
-                                            let pid = provider.id.clone();
-                                            let pname = provider.name.clone();
-                                            let at = app_type_str.to_string();
-                                            tokio::spawn(async move {
-                                                let _ = fm
-                                                    .try_switch(ah.as_ref(), &at, &pid, &pname)
-                                                    .await;
-                                            });
-                                        }
-                                        if status.total_requests > 0 {
-                                            status.success_rate = (status.success_requests as f32
-                                                / status.total_requests as f32)
-                                                * 100.0;
-                                        }
-                                    }
-
-                                    return Ok(ForwardResult {
-                                        response,
-                                        provider: provider.clone(),
-                                        claude_api_format,
-                                        outbound_model,
-                                        connection_guard: None,
-                                    });
-                                }
-                                Err(retry_err) => {
-                                    log::warn!(
-                                        "[{app_type_str}] [RECT-012] budget 整流重试仍失败: {retry_err}"
-                                    );
-                                    if let Some(err) = self
-                                        .handle_rectifier_retry_failure(
-                                            retry_err,
-                                            provider,
-                                            app_type_str,
-                                            used_half_open_permit,
-                                            "budget 整流",
-                                            &mut last_error,
-                                            &mut last_provider,
-                                        )
-                                        .await
-                                    {
-                                        return Err(err);
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-
-                    if signature_rectifier_non_retryable_client_error {
-                        self.router
-                            .release_permit_neutral(
-                                &provider.id,
-                                app_type_str,
-                                used_half_open_permit,
-                            )
-                            .await;
+                Err(failure) => {
+                    if !failure.allow_failover {
                         let mut status = self.status.write().await;
                         status.failed_requests += 1;
-                        status.last_error = Some(e.to_string());
+                        status.last_error = Some(failure.error.to_string());
                         if status.total_requests > 0 {
                             status.success_rate = (status.success_requests as f32
                                 / status.total_requests as f32)
                                 * 100.0;
                         }
                         return Err(ForwardError {
-                            error: e,
+                            error: failure.error,
                             provider: Some(provider.clone()),
                         });
                     }
 
-                    // 先分类错误，决定是否计入 provider 健康度
-                    // —— NonRetryable / ClientAbort 是客户端层错误，无论换哪家 provider 都会被拒绝，
-                    //    不应污染熔断器和数据库健康度（与 release_permit_neutral 同语义）。
-                    let category = self.categorize_proxy_error(&e, provider);
-
-                    match category {
+                    match self.categorize_proxy_error(&failure.error, provider) {
                         ErrorCategory::Retryable => {
-                            // 可重试：真正的 provider 故障 → 记录失败并更新熔断器/DB 健康度
-                            let _ = self
-                                .router
-                                .record_result(
-                                    &provider.id,
-                                    app_type_str,
-                                    used_half_open_permit,
-                                    false,
-                                    Some(e.to_string()),
-                                )
-                                .await;
-
                             {
                                 let mut status = self.status.write().await;
-                                status.last_error =
-                                    Some(format!("Provider {} 失败: {}", provider.name, e));
+                                status.last_error = Some(format!(
+                                    "Provider {} 失败: {}",
+                                    provider.name, failure.error
+                                ));
                             }
-
                             let (log_code, log_message) = build_retryable_failure_log(
                                 &provider.name,
                                 attempted_providers,
                                 providers.len(),
-                                &e,
+                                &failure.error,
                             );
                             log::warn!("[{app_type_str}] [{log_code}] {log_message}");
-
-                            last_error = Some(e);
+                            last_error = Some(failure.error);
                             last_provider = Some(provider.clone());
-                            // 继续尝试下一个供应商
-                            continue;
                         }
                         ErrorCategory::NonRetryable | ErrorCategory::ClientAbort => {
-                            // 不可重试：客户端层错误或客户端断连 → 不污染健康度，仅释放 HalfOpen permit
-                            self.router
-                                .release_permit_neutral(
-                                    &provider.id,
-                                    app_type_str,
-                                    used_half_open_permit,
-                                )
-                                .await;
-                            {
-                                let mut status = self.status.write().await;
-                                status.failed_requests += 1;
-                                status.last_error = Some(e.to_string());
-                                if status.total_requests > 0 {
-                                    status.success_rate = (status.success_requests as f32
-                                        / status.total_requests as f32)
-                                        * 100.0;
-                                }
+                            last_error = Some(failure.error);
+                            last_provider = Some(provider.clone());
+                            let mut status = self.status.write().await;
+                            status.failed_requests += 1;
+                            status.last_error = last_error.as_ref().map(ToString::to_string);
+                            if status.total_requests > 0 {
+                                status.success_rate = (status.success_requests as f32
+                                    / status.total_requests as f32)
+                                    * 100.0;
                             }
                             return Err(ForwardError {
-                                error: e,
-                                provider: Some(provider.clone()),
+                                error: last_error.take().unwrap_or(ProxyError::MaxRetriesExceeded),
+                                provider: last_provider.take(),
                             });
                         }
                     }
@@ -1097,15 +672,12 @@ impl RequestForwarder {
         }
 
         if attempted_providers == 0 {
-            // providers 列表非空，但全部被熔断器拒绝（典型：HalfOpen 探测名额被占用）
-            {
-                let mut status = self.status.write().await;
-                status.failed_requests += 1;
-                status.last_error = Some("所有供应商暂时不可用（熔断器限制）".to_string());
-                if status.total_requests > 0 {
-                    status.success_rate =
-                        (status.success_requests as f32 / status.total_requests as f32) * 100.0;
-                }
+            let mut status = self.status.write().await;
+            status.failed_requests += 1;
+            status.last_error = Some("所有供应商暂时不可用（熔断器限制）".to_string());
+            if status.total_requests > 0 {
+                status.success_rate =
+                    (status.success_requests as f32 / status.total_requests as f32) * 100.0;
             }
             return Err(ForwardError {
                 error: ProxyError::NoAvailableProvider,
@@ -1113,7 +685,6 @@ impl RequestForwarder {
             });
         }
 
-        // 所有供应商都失败了
         {
             let mut status = self.status.write().await;
             status.failed_requests += 1;
@@ -1136,6 +707,460 @@ impl RequestForwarder {
         })
     }
 
+    fn effective_attempt_timeout(
+        &self,
+        policy: &ProviderRetryPolicy,
+        request_is_streaming: bool,
+    ) -> std::time::Duration {
+        let provider_timeout = std::time::Duration::from_secs(policy.per_attempt_timeout_seconds);
+        let app_timeout = if request_is_streaming {
+            self.streaming_first_byte_timeout
+        } else {
+            self.non_streaming_timeout
+        };
+        match (provider_timeout.is_zero(), app_timeout.is_zero()) {
+            (true, true) => std::time::Duration::ZERO,
+            (true, false) => app_timeout,
+            (false, true) => provider_timeout,
+            (false, false) => provider_timeout.min(app_timeout),
+        }
+    }
+    fn attempt_deadline(timeout: std::time::Duration) -> Option<tokio::time::Instant> {
+        (!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout)
+    }
+
+    fn remaining_attempt_time(
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<std::time::Duration> {
+        deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+    }
+    fn provider_attempt_indices(policy: ProviderRetryPolicy) -> impl Iterator<Item = usize> {
+        let ordinary_budget = (policy.retry_count as usize).saturating_add(1);
+        std::iter::successors(Some(0usize), move |attempt_index| {
+            if policy.unlimited_retries {
+                Some(attempt_index.saturating_add(1))
+            } else if attempt_index.saturating_add(1) < ordinary_budget {
+                Some(attempt_index.saturating_add(1))
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn wait_before_retry(retry_wait_seconds: u64) {
+        if retry_wait_seconds > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(retry_wait_seconds)).await;
+        }
+    }
+
+    fn categorize_same_provider_error(&self, error: &ProxyError) -> ErrorCategory {
+        match error {
+            ProxyError::Timeout(_) => ErrorCategory::Retryable,
+            ProxyError::ForwardFailed(message) if is_connect_failure_message(message) => {
+                ErrorCategory::Retryable
+            }
+            ProxyError::UpstreamError { status, .. } if (500..=599).contains(status) => {
+                ErrorCategory::Retryable
+            }
+            _ => ErrorCategory::NonRetryable,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_provider_slot(
+        &self,
+        app_type: &AppType,
+        method: http::Method,
+        endpoint: &str,
+        body: &Value,
+        headers: &axum::http::HeaderMap,
+        extensions: &Extensions,
+        provider: &Provider,
+        adapter: &dyn ProviderAdapter,
+        policy: ProviderRetryPolicy,
+        permit: &mut ProviderAttemptPermit,
+    ) -> Result<ProviderForwardedResponse, ProviderSlotFailure> {
+        let mut state = ProviderSlotState::SlotStart;
+        log::trace!(
+            "[{}] retry state={state:?}, provider_id={}",
+            app_type.as_str(),
+            provider.id
+        );
+        let ordinary_budget = (policy.retry_count as usize).saturating_add(1);
+        let policy_enabled = policy.enabled();
+        let mut provider_body = if self.optimizer_config.enabled && is_bedrock_provider(provider) {
+            let mut optimized = body.clone();
+            if self.optimizer_config.thinking_optimizer {
+                super::thinking_optimizer::optimize(&mut optimized, &self.optimizer_config);
+            }
+            if self.optimizer_config.cache_injection {
+                super::cache_injector::inject(&mut optimized, &self.optimizer_config);
+            }
+            optimized
+        } else {
+            body.clone()
+        };
+        self.apply_media_prevention(&mut provider_body, provider);
+
+        let mut rectifier_retried = false;
+        let mut budget_rectifier_retried = false;
+        let mut media_rectifier_retried = false;
+        let mut pinned = ProviderExecutionPin::default();
+
+        let attempt_indices = Self::provider_attempt_indices(policy);
+        for attempt_index in attempt_indices {
+            state = ProviderSlotState::OrdinaryAttempt(attempt_index);
+            log::trace!(
+                "[{}] retry state={state:?}, provider_id={}, policy_retry_count={}",
+                app_type.as_str(),
+                provider.id,
+                policy.retry_count
+            );
+            let request_is_streaming = is_streaming_request(endpoint, &provider_body, headers);
+            let attempt_timeout = self.effective_attempt_timeout(&policy, request_is_streaming);
+            let attempt_started = tokio::time::Instant::now();
+
+            let result = self
+                .forward(
+                    app_type,
+                    &method,
+                    provider,
+                    endpoint,
+                    &provider_body,
+                    headers,
+                    extensions,
+                    adapter,
+                    &mut pinned,
+                    attempt_timeout,
+                    policy_enabled,
+                )
+                .await;
+
+            let error = match result {
+                Ok((response, claude_api_format, outbound_model)) => {
+                    log::debug!(
+                        "[{}] provider_attempt provider_id={}, phase=ordinary, attempt={}, outcome=success, elapsed_ms={}",
+                        app_type.as_str(),
+                        provider.id,
+                        attempt_index,
+                        attempt_started.elapsed().as_millis()
+                    );
+                    state = ProviderSlotState::Complete;
+                    log::trace!(
+                        "[{}] retry state={state:?}, provider_id={}, attempt={}",
+                        app_type.as_str(),
+                        provider.id,
+                        attempt_index
+                    );
+                    permit.record_success(self).await;
+                    return Ok(ProviderForwardedResponse {
+                        response,
+                        claude_api_format,
+                        outbound_model,
+                    });
+                }
+                Err(error) => {
+                    log::debug!(
+                        "[{}] provider_attempt provider_id={}, phase=ordinary, attempt={}, outcome=error, same_provider_category={:?}, elapsed_ms={}",
+                        app_type.as_str(),
+                        provider.id,
+                        attempt_index,
+                        self.categorize_same_provider_error(&error),
+                        attempt_started.elapsed().as_millis()
+                    );
+                    error
+                }
+            };
+
+            state = ProviderSlotState::RepairNeeded;
+            log::trace!(
+                "[{}] retry state={state:?}, provider_id={}, attempt={}",
+                app_type.as_str(),
+                provider.id,
+                attempt_index
+            );
+            let repair = self
+                .try_provider_repairs(
+                    app_type,
+                    &method,
+                    provider,
+                    endpoint,
+                    &mut provider_body,
+                    headers,
+                    extensions,
+                    adapter,
+                    &error,
+                    &mut rectifier_retried,
+                    &mut budget_rectifier_retried,
+                    &mut media_rectifier_retried,
+                    &mut pinned,
+                    attempt_timeout,
+                    policy_enabled,
+                )
+                .await;
+
+            let error = match repair {
+                ProviderRepairOutcome::NotNeeded => error,
+                ProviderRepairOutcome::Success(forwarded) => {
+                    state = ProviderSlotState::Complete;
+                    log::trace!(
+                        "[{}] retry state={state:?}, provider_id={}, repair_success=true",
+                        app_type.as_str(),
+                        provider.id
+                    );
+                    permit.record_success(self).await;
+                    return Ok(forwarded);
+                }
+                ProviderRepairOutcome::Failed {
+                    error,
+                    allow_failover,
+                } => {
+                    if !allow_failover {
+                        permit.release_neutral().await;
+                        return Err(ProviderSlotFailure {
+                            error,
+                            allow_failover: false,
+                        });
+                    }
+                    error
+                }
+                ProviderRepairOutcome::FailedOriginal { allow_failover } => {
+                    if !allow_failover {
+                        permit.release_neutral().await;
+                        return Err(ProviderSlotFailure {
+                            error,
+                            allow_failover: false,
+                        });
+                    }
+                    error
+                }
+            };
+
+            if self.categorize_same_provider_error(&error) == ErrorCategory::Retryable
+                && (policy.unlimited_retries || attempt_index.saturating_add(1) < ordinary_budget)
+            {
+                state = ProviderSlotState::Retryable;
+                log::trace!(
+                    "[{}] retry state={state:?}, provider_id={}, attempt={}, wait_seconds={}",
+                    app_type.as_str(),
+                    provider.id,
+                    attempt_index,
+                    policy.retry_wait_seconds
+                );
+                Self::wait_before_retry(policy.retry_wait_seconds).await;
+                continue;
+            }
+
+            let outer_retryable =
+                self.categorize_proxy_error(&error, provider) == ErrorCategory::Retryable;
+            match self.categorize_same_provider_error(&error) {
+                ErrorCategory::Retryable => {
+                    if outer_retryable {
+                        permit.record_failure(&error).await;
+                    } else {
+                        permit.release_neutral().await;
+                    }
+                    return Err(ProviderSlotFailure {
+                        error,
+                        allow_failover: true,
+                    });
+                }
+                ErrorCategory::NonRetryable | ErrorCategory::ClientAbort => {
+                    if outer_retryable {
+                        permit.record_failure(&error).await;
+                    } else {
+                        permit.release_neutral().await;
+                    }
+                    return Err(ProviderSlotFailure {
+                        error,
+                        allow_failover: true,
+                    });
+                }
+            }
+        }
+
+        let error = ProxyError::MaxRetriesExceeded;
+        permit.record_failure(&error).await;
+        Err(ProviderSlotFailure {
+            error,
+            allow_failover: true,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_provider_repairs(
+        &self,
+        app_type: &AppType,
+        method: &http::Method,
+        provider: &Provider,
+        endpoint: &str,
+        provider_body: &mut Value,
+        headers: &axum::http::HeaderMap,
+        extensions: &Extensions,
+        adapter: &dyn ProviderAdapter,
+        error: &ProxyError,
+        rectifier_retried: &mut bool,
+        budget_rectifier_retried: &mut bool,
+        media_rectifier_retried: &mut bool,
+        pinned: &mut ProviderExecutionPin,
+        attempt_timeout: std::time::Duration,
+        policy_enabled: bool,
+    ) -> ProviderRepairOutcome {
+        let provider_type = ProviderType::from_app_type_and_config(app_type, provider);
+        let is_anthropic_provider = matches!(
+            provider_type,
+            Some(ProviderType::Claude | ProviderType::ClaudeAuth)
+        );
+
+        if self.media_retry_should_trigger(
+            adapter.name(),
+            *media_rectifier_retried,
+            provider_body,
+            error,
+        ) {
+            let mut media_body = provider_body.clone();
+            let replaced_images =
+                super::media_sanitizer::replace_image_blocks_with_marker(&mut media_body);
+            if replaced_images > 0 {
+                *media_rectifier_retried = true;
+                *provider_body = media_body.clone();
+                match self
+                    .forward(
+                        app_type,
+                        method,
+                        provider,
+                        endpoint,
+                        &media_body,
+                        headers,
+                        extensions,
+                        adapter,
+                        pinned,
+                        attempt_timeout,
+                        policy_enabled,
+                    )
+                    .await
+                {
+                    Ok((response, claude_api_format, outbound_model)) => {
+                        return ProviderRepairOutcome::Success(ProviderForwardedResponse {
+                            response,
+                            claude_api_format,
+                            outbound_model,
+                        });
+                    }
+                    Err(retry_error) => {
+                        return ProviderRepairOutcome::Failed {
+                            allow_failover: self.categorize_proxy_error(&retry_error, provider)
+                                == ErrorCategory::Retryable,
+                            error: retry_error,
+                        };
+                    }
+                }
+            }
+        }
+
+        if is_anthropic_provider {
+            let error_message = extract_error_message(error);
+            if should_rectify_thinking_signature(error_message.as_deref(), &self.rectifier_config) {
+                if *rectifier_retried {
+                    return ProviderRepairOutcome::FailedOriginal {
+                        allow_failover: false,
+                    };
+                }
+
+                let rectified = rectify_anthropic_request(provider_body);
+                if rectified.applied {
+                    *rectifier_retried = true;
+                    match self
+                        .forward(
+                            app_type,
+                            method,
+                            provider,
+                            endpoint,
+                            provider_body,
+                            headers,
+                            extensions,
+                            adapter,
+                            pinned,
+                            attempt_timeout,
+                            policy_enabled,
+                        )
+                        .await
+                    {
+                        Ok((response, claude_api_format, outbound_model)) => {
+                            return ProviderRepairOutcome::Success(ProviderForwardedResponse {
+                                response,
+                                claude_api_format,
+                                outbound_model,
+                            });
+                        }
+                        Err(retry_error) => {
+                            return ProviderRepairOutcome::Failed {
+                                allow_failover: self.categorize_proxy_error(&retry_error, provider)
+                                    == ErrorCategory::Retryable,
+                                error: retry_error,
+                            };
+                        }
+                    }
+                }
+            }
+
+            if should_rectify_thinking_budget(error_message.as_deref(), &self.rectifier_config) {
+                if *budget_rectifier_retried {
+                    return ProviderRepairOutcome::FailedOriginal {
+                        allow_failover: false,
+                    };
+                }
+                let rectified = rectify_thinking_budget(provider_body);
+                if rectified.applied {
+                    *budget_rectifier_retried = true;
+                    match self
+                        .forward(
+                            app_type,
+                            method,
+                            provider,
+                            endpoint,
+                            provider_body,
+                            headers,
+                            extensions,
+                            adapter,
+                            pinned,
+                            attempt_timeout,
+                            policy_enabled,
+                        )
+                        .await
+                    {
+                        Ok((response, claude_api_format, outbound_model)) => {
+                            return ProviderRepairOutcome::Success(ProviderForwardedResponse {
+                                response,
+                                claude_api_format,
+                                outbound_model,
+                            });
+                        }
+                        Err(retry_error) => {
+                            return ProviderRepairOutcome::Failed {
+                                allow_failover: self.categorize_proxy_error(&retry_error, provider)
+                                    == ErrorCategory::Retryable,
+                                error: retry_error,
+                            };
+                        }
+                    }
+                }
+            }
+
+            // A matching signature/budget error with no applicable repair is a
+            // client/configuration error, preserving the old one-shot behavior.
+            if should_rectify_thinking_signature(error_message.as_deref(), &self.rectifier_config)
+                || should_rectify_thinking_budget(error_message.as_deref(), &self.rectifier_config)
+            {
+                return ProviderRepairOutcome::FailedOriginal {
+                    allow_failover: false,
+                };
+            }
+        }
+
+        ProviderRepairOutcome::NotNeeded
+    }
+
     /// 转发单个请求（使用适配器）
     ///
     /// 成功时返回 `(response, claude_api_format, outbound_model)`，其中
@@ -1151,10 +1176,19 @@ impl RequestForwarder {
         headers: &axum::http::HeaderMap,
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
+        pinned: &mut ProviderExecutionPin,
+        attempt_timeout: std::time::Duration,
+        policy_enabled: bool,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
-        // 使用适配器提取 base_url
-        let mut base_url = adapter.extract_base_url(provider)?;
-
+        let deadline = Self::attempt_deadline(attempt_timeout);
+        // Resolve the endpoint once per provider slot. In particular, Copilot's
+        // account-specific endpoint must not change between ordinary retries or
+        // one-shot repairs.
+        let endpoint_pinned = pinned.base_url.is_some();
+        let mut base_url = pinned
+            .base_url
+            .clone()
+            .unwrap_or(adapter.extract_base_url(provider)?);
         let is_full_url = provider
             .meta
             .as_ref()
@@ -1334,7 +1368,7 @@ impl RequestForwarder {
 
         // GitHub Copilot 动态 endpoint 路由
         // 从 CopilotAuthManager 获取缓存的 API endpoint（支持企业版等非默认 endpoint）
-        if is_copilot && !is_full_url {
+        if is_copilot && !is_full_url && !endpoint_pinned {
             if let Some(app_handle) = &self.app_handle {
                 let copilot_state = app_handle.state::<CopilotAuthState>();
                 let copilot_auth = copilot_state.0.read().await;
@@ -1360,6 +1394,9 @@ impl RequestForwarder {
                     base_url = dynamic_endpoint;
                 }
             }
+        }
+        if pinned.base_url.is_none() {
+            pinned.base_url = Some(base_url.clone());
         }
         let resolved_claude_api_format = if adapter.name() == "Claude" {
             Some(
@@ -1642,163 +1679,144 @@ impl RequestForwarder {
             || codex_responses_to_anthropic
             || request_is_streaming;
 
-        // Codex OAuth 需要注入的 ChatGPT-Account-Id（在动态 token 获取期间填充）
-        let mut codex_oauth_account_id: Option<String> = None;
+        // Resolve credentials once per provider slot. OAuth managers may rotate their
+        // default account or refresh a token while a request is in flight; re-reading
+        // them during same-provider retries would violate the pinned execution context.
+        let auth_was_pinned = pinned.auth_resolved;
+        let auth_snapshot = if auth_was_pinned {
+            pinned.auth.clone()
+        } else {
+            let auth = adapter.extract_auth(provider);
+            pinned.auth = auth.clone();
+            pinned.auth_resolved = true;
+            auth
+        };
+        let mut codex_oauth_account_id = pinned.codex_oauth_account_id.clone();
         let mut should_send_codex_oauth_session_headers = false;
 
-        // 获取认证头（提前准备，用于内联替换），同时保留仅用于日志脱敏的
-        // 精确认证材料。实际日志永远不输出这些值。
+        // Keep exact authentication material only for in-memory URL/header redaction.
+        // It is never included in logs.
         let mut log_secrets: Vec<String> = Vec::new();
-        let mut auth_headers = if let Some(mut auth) = adapter.extract_auth(provider) {
-            // GitHub Copilot 特殊处理：从 CopilotAuthManager 获取真实 token
-            if auth.strategy == AuthStrategy::GitHubCopilot {
-                if let Some(app_handle) = &self.app_handle {
-                    let copilot_state = app_handle.state::<CopilotAuthState>();
-                    let copilot_auth: tokio::sync::RwLockReadGuard<'_, CopilotAuthManager> =
-                        copilot_state.0.read().await;
-
-                    // 从 provider.meta 获取关联的 GitHub 账号 ID（多账号支持）
-                    let account_id = provider
-                        .meta
-                        .as_ref()
-                        .and_then(|m| m.managed_account_id_for("github_copilot"));
-
-                    // 根据账号 ID 获取对应 token（向后兼容：无账号 ID 时使用第一个账号）
-                    let token_result = match &account_id {
-                        Some(id) => {
-                            log::debug!("[Copilot] 使用指定账号 {id} 获取 token");
-                            copilot_auth.get_valid_token_for_account(id).await
-                        }
-                        None => {
-                            log::debug!("[Copilot] 使用默认账号获取 token");
-                            copilot_auth.get_valid_token().await
-                        }
-                    };
-
-                    match token_result {
-                        Ok(token) => {
-                            auth = AuthInfo::new(token, AuthStrategy::GitHubCopilot);
-                            log::debug!(
-                                "[Copilot] 成功获取 Copilot token (account={})",
-                                account_id.as_deref().unwrap_or("default")
-                            );
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "[Copilot] 获取 Copilot token 失败 (account={}): {e}",
-                                account_id.as_deref().unwrap_or("default")
-                            );
-                            return Err(ProxyError::AuthError(format!(
-                                "GitHub Copilot 认证失败: {e}"
-                            )));
-                        }
+        let mut auth_headers = if let Some(mut auth) = auth_snapshot {
+            if !auth_was_pinned {
+                // GitHub Copilot: resolve the selected managed account once.
+                if auth.strategy == AuthStrategy::GitHubCopilot {
+                    if let Some(app_handle) = &self.app_handle {
+                        let copilot_state = app_handle.state::<CopilotAuthState>();
+                        let copilot_auth: tokio::sync::RwLockReadGuard<'_, CopilotAuthManager> =
+                            copilot_state.0.read().await;
+                        let account_id = provider
+                            .meta
+                            .as_ref()
+                            .and_then(|m| m.managed_account_id_for("github_copilot"));
+                        let token_result = match &account_id {
+                            Some(id) => {
+                                log::debug!("[Copilot] 使用指定账号 {id} 获取 token");
+                                copilot_auth.get_valid_token_for_account(id).await
+                            }
+                            None => {
+                                log::debug!("[Copilot] 使用默认账号获取 token");
+                                copilot_auth.get_valid_token().await
+                            }
+                        };
+                        auth = AuthInfo::new(
+                            token_result.map_err(|error| {
+                                ProxyError::AuthError(format!("GitHub Copilot 认证失败: {error}"))
+                            })?,
+                            AuthStrategy::GitHubCopilot,
+                        );
+                        log::debug!(
+                            "[Copilot] 成功获取 Copilot token (account={})",
+                            account_id.as_deref().unwrap_or("default")
+                        );
+                    } else {
+                        return Err(ProxyError::AuthError(
+                            "GitHub Copilot 认证不可用（无 AppHandle）".to_string(),
+                        ));
                     }
-                } else {
-                    log::error!("[Copilot] AppHandle 不可用");
-                    return Err(ProxyError::AuthError(
-                        "GitHub Copilot 认证不可用（无 AppHandle）".to_string(),
-                    ));
+                }
+
+                // Codex OAuth: resolve the selected managed account and token once.
+                if auth.strategy == AuthStrategy::CodexOAuth {
+                    if let Some(app_handle) = &self.app_handle {
+                        let codex_state = app_handle.state::<CodexOAuthState>();
+                        let codex_auth = &codex_state.0;
+                        let account_id = provider
+                            .meta
+                            .as_ref()
+                            .and_then(|m| m.managed_account_id_for("codex_oauth"));
+                        let token_result = match &account_id {
+                            Some(id) => {
+                                log::debug!("[CodexOAuth] 使用指定账号 {id} 获取 token");
+                                codex_auth.get_valid_token_for_account(id).await
+                            }
+                            None => {
+                                log::debug!("[CodexOAuth] 使用默认账号获取 token");
+                                codex_auth.get_valid_token().await
+                            }
+                        };
+                        let token = token_result.map_err(|error| {
+                            ProxyError::AuthError(format!("Codex OAuth 认证失败: {error}"))
+                        })?;
+                        auth = AuthInfo::new(token, AuthStrategy::CodexOAuth);
+                        codex_oauth_account_id = match account_id {
+                            Some(id) => Some(id),
+                            None => codex_auth.default_account_id().await,
+                        };
+                        pinned.codex_oauth_account_id = codex_oauth_account_id.clone();
+                        log::debug!(
+                            "[CodexOAuth] 成功获取 access_token (account={})",
+                            codex_oauth_account_id.as_deref().unwrap_or("default")
+                        );
+                    } else {
+                        return Err(ProxyError::AuthError(
+                            "Codex OAuth 认证不可用（无 AppHandle）".to_string(),
+                        ));
+                    }
+                }
+
+                // xAI OAuth: resolve the selected managed account once.
+                if auth.strategy == AuthStrategy::XaiOAuth {
+                    if let Some(app_handle) = &self.app_handle {
+                        let xai_state = app_handle.state::<XaiOAuthState>();
+                        let xai_auth: tokio::sync::RwLockReadGuard<'_, XaiOAuthManager> =
+                            xai_state.0.read().await;
+                        let account_id = provider
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.managed_account_id_for("xai_oauth"));
+                        let token_result = match &account_id {
+                            Some(id) => xai_auth.get_valid_token_for_account(id).await,
+                            None => xai_auth.get_valid_token().await,
+                        };
+                        auth = AuthInfo::new(
+                            token_result.map_err(|error| {
+                                ProxyError::AuthError(format!("xAI OAuth 认证失败: {error}"))
+                            })?,
+                            AuthStrategy::XaiOAuth,
+                        );
+                        log::debug!(
+                            "[XaiOAuth] 成功获取 access_token (account={})",
+                            account_id.as_deref().unwrap_or("default")
+                        );
+                    } else {
+                        return Err(ProxyError::AuthError(
+                            "xAI OAuth 认证不可用（无 AppHandle）".to_string(),
+                        ));
+                    }
                 }
             }
 
-            // Codex OAuth 特殊处理：从 CodexOAuthManager 获取真实 access_token
-            if auth.strategy == AuthStrategy::CodexOAuth {
-                if let Some(app_handle) = &self.app_handle {
-                    let codex_state = app_handle.state::<CodexOAuthState>();
-                    let codex_auth = &codex_state.0;
-
-                    // 从 provider.meta 获取关联的 ChatGPT 账号 ID
-                    let account_id = provider
-                        .meta
-                        .as_ref()
-                        .and_then(|m| m.managed_account_id_for("codex_oauth"));
-
-                    let token_result = match &account_id {
-                        Some(id) => {
-                            log::debug!("[CodexOAuth] 使用指定账号 {id} 获取 token");
-                            codex_auth.get_valid_token_for_account(id).await
-                        }
-                        None => {
-                            log::debug!("[CodexOAuth] 使用默认账号获取 token");
-                            codex_auth.get_valid_token().await
-                        }
-                    };
-
-                    match token_result {
-                        Ok(token) => {
-                            auth = AuthInfo::new(token, AuthStrategy::CodexOAuth);
-                            should_send_codex_oauth_session_headers = true;
-                            // 解析使用的 account_id（用于注入 ChatGPT-Account-Id header）
-                            codex_oauth_account_id = match account_id {
-                                Some(id) => Some(id),
-                                None => codex_auth.default_account_id().await,
-                            };
-                            log::debug!(
-                                "[CodexOAuth] 成功获取 access_token (account={})",
-                                codex_oauth_account_id.as_deref().unwrap_or("default")
-                            );
-                        }
-                        Err(e) => {
-                            log::error!("[CodexOAuth] 获取 access_token 失败: {e}");
-                            return Err(ProxyError::AuthError(format!(
-                                "Codex OAuth 认证失败: {e}"
-                            )));
-                        }
-                    }
-                } else {
-                    log::error!("[CodexOAuth] AppHandle 不可用");
-                    return Err(ProxyError::AuthError(
-                        "Codex OAuth 认证不可用（无 AppHandle）".to_string(),
-                    ));
-                }
-            }
-
-            // xAI OAuth: resolve a managed account token immediately before
-            // sending the request. Invalid refresh credentials are persisted as
-            // requiring re-authentication by the manager.
-            if auth.strategy == AuthStrategy::XaiOAuth {
-                if let Some(app_handle) = &self.app_handle {
-                    let xai_state = app_handle.state::<XaiOAuthState>();
-                    let xai_auth: tokio::sync::RwLockReadGuard<'_, XaiOAuthManager> =
-                        xai_state.0.read().await;
-                    let account_id = provider
-                        .meta
-                        .as_ref()
-                        .and_then(|meta| meta.managed_account_id_for("xai_oauth"));
-                    let token_result = match &account_id {
-                        Some(id) => xai_auth.get_valid_token_for_account(id).await,
-                        None => xai_auth.get_valid_token().await,
-                    };
-                    match token_result {
-                        Ok(token) => {
-                            auth = AuthInfo::new(token, AuthStrategy::XaiOAuth);
-                            log::debug!(
-                                "[XaiOAuth] 成功获取 access_token (account={})",
-                                account_id.as_deref().unwrap_or("default")
-                            );
-                        }
-                        Err(error) => {
-                            log::error!("[XaiOAuth] 获取 access_token 失败: {error}");
-                            return Err(ProxyError::AuthError(format!(
-                                "xAI OAuth 认证失败: {error}"
-                            )));
-                        }
-                    }
-                } else {
-                    return Err(ProxyError::AuthError(
-                        "xAI OAuth 认证不可用（无 AppHandle）".to_string(),
-                    ));
-                }
-            }
-
+            should_send_codex_oauth_session_headers = auth.strategy == AuthStrategy::CodexOAuth;
+            pinned.auth = Some(auth.clone());
             for secret in std::iter::once(&auth.api_key).chain(auth.access_token.iter()) {
                 if !secret.is_empty() && !log_secrets.contains(secret) {
                     log_secrets.push(secret.clone());
                 }
             }
-
             adapter.get_auth_headers(&auth)?
         } else {
+            pinned.auth = None;
             Vec::new()
         };
 
@@ -2226,12 +2244,19 @@ impl RequestForwarder {
             short_value_hash(Some(&filtered_body))
         );
 
-        // 确定超时
-        let timeout = if self.non_streaming_timeout.is_zero() {
-            std::time::Duration::from_secs(600) // 默认 600 秒
-        } else {
-            self.non_streaming_timeout
-        };
+        let send_remaining = Self::remaining_attempt_time(deadline);
+        if send_remaining.is_some_and(|remaining| remaining.is_zero()) {
+            return Err(ProxyError::Timeout(
+                "Provider attempt deadline exceeded before upstream send".to_string(),
+            ));
+        }
+        let timeout = send_remaining.unwrap_or_else(|| {
+            if self.non_streaming_timeout.is_zero() {
+                std::time::Duration::from_secs(600)
+            } else {
+                self.non_streaming_timeout
+            }
+        });
 
         // 获取全局代理 URL
         let upstream_proxy_url: Option<String> = super::http_client::get_current_proxy_url();
@@ -2259,9 +2284,11 @@ impl RequestForwarder {
             let client = super::http_client::get();
             let mut request = client.request(method.clone(), &url);
             if request_is_streaming {
-                // reqwest 的 timeout 是整请求超时；流式请求交给 response_processor
-                // 的首包/静默期超时控制，避免长流被总时长误杀。
+                // reqwest's timeout is a total request timeout; streaming body
+                // lifetime remains governed by downstream idle-timeout handling.
                 request = request.timeout(std::time::Duration::from_secs(24 * 60 * 60));
+            } else if let Some(remaining) = send_remaining {
+                request = request.timeout(remaining);
             } else if !self.non_streaming_timeout.is_zero() {
                 request = request.timeout(self.non_streaming_timeout);
             }
@@ -2270,18 +2297,21 @@ impl RequestForwarder {
             }
             let send = request.body(body_bytes).send();
             let send_result = if request_is_streaming {
-                let header_timeout = if self.streaming_first_byte_timeout.is_zero() {
-                    timeout
-                } else {
-                    self.streaming_first_byte_timeout
-                };
+                let header_timeout = send_remaining.unwrap_or(timeout);
                 tokio::time::timeout(header_timeout, send)
                     .await
                     .map_err(|_| {
-                        ProxyError::Timeout(format!(
-                            "流式响应首包超时: {}s（上游未返回响应头）",
-                            header_timeout.as_secs()
-                        ))
+                        if deadline.is_some() {
+                            ProxyError::Timeout(
+                                "Provider attempt deadline exceeded before upstream headers"
+                                    .to_string(),
+                            )
+                        } else {
+                            ProxyError::Timeout(format!(
+                                "流式响应首包超时: {}s（上游未返回响应头）",
+                                header_timeout.as_secs()
+                            ))
+                        }
                     })?
             } else {
                 send.await
@@ -2301,7 +2331,7 @@ impl RequestForwarder {
                 ordered_headers,
                 extensions.clone(),
                 body_bytes,
-                timeout,
+                send_remaining.unwrap_or(timeout),
                 upstream_proxy_url.as_deref(),
             )
             .await?
@@ -2312,7 +2342,12 @@ impl RequestForwarder {
 
         if status.is_success() {
             let mut response = self
-                .prepare_success_response_for_failover(response, request_is_streaming)
+                .prepare_success_response_for_failover(
+                    response,
+                    request_is_streaming,
+                    deadline,
+                    policy_enabled,
+                )
                 .await?;
             // Streaming requests normally return SSE. If a compatible gateway
             // explicitly returns JSON instead, buffer and validate it inside the retry
@@ -2320,7 +2355,7 @@ impl RequestForwarder {
             // not buffer unknown content types: some gateways omit the SSE header.
             if codex_responses_to_anthropic && (!request_is_streaming || response.is_json()) {
                 response = self
-                    .validate_codex_anthropic_success_response(response)
+                    .validate_codex_anthropic_success_response(response, deadline)
                     .await?;
             } else if matches!(
                 resolved_claude_api_format.as_deref(),
@@ -2330,12 +2365,16 @@ impl RequestForwarder {
                     // Claude→Responses gateways can also return a semantic failure in an
                     // HTTP 2xx Response object. Validate buffered/JSON bodies inside the
                     // retry loop so an early failure can still select another provider.
-                    response = self.validate_responses_success_response(response).await?;
+                    response = self
+                        .validate_responses_success_response(response, deadline)
+                        .await?;
                 } else {
                     // Delay committing the downstream stream until the upstream emits
                     // either productive output or a valid non-failure terminal event.
                     // A response.failed/error before output remains failover-safe.
-                    response = self.validate_responses_stream_start(response).await?;
+                    response = self
+                        .validate_responses_stream_start(response, deadline)
+                        .await?;
                 }
             }
             Ok((response, resolved_claude_api_format, outbound_model))
@@ -2345,7 +2384,19 @@ impl RequestForwarder {
             // 自动解压 feature，这里拿到的是原始字节；不解压的话，压缩过的错误体会
             // 在 from_utf8 处变成非 UTF-8 而被丢弃，隐藏掉上游的限流/鉴权等详情。
             let encoding = get_content_encoding(response.headers());
-            let raw = response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES).await?;
+            let raw = match Self::remaining_attempt_time(deadline) {
+                Some(remaining) => tokio::time::timeout(
+                    remaining,
+                    response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES),
+                )
+                .await
+                .map_err(|_| {
+                    ProxyError::Timeout(
+                        "Provider attempt deadline exceeded while reading error body".to_string(),
+                    )
+                })??,
+                None => response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES).await?,
+            };
             let decoded = match encoding {
                 Some(encoding) => {
                     match decompress_body_with_limit(&encoding, &raw, MAX_RESPONSE_BODY_BYTES) {
@@ -2374,31 +2425,67 @@ impl RequestForwarder {
         &self,
         response: ProxyResponse,
         request_is_streaming: bool,
+        deadline: Option<tokio::time::Instant>,
+        policy_enabled: bool,
     ) -> Result<ProxyResponse, ProxyError> {
         if request_is_streaming {
-            return self.prime_streaming_response(response).await;
+            return self
+                .prime_streaming_response(response, deadline, policy_enabled)
+                .await;
         }
 
-        if self.non_streaming_timeout.is_zero() {
+        // A provider policy enables buffering even when app-level failover timeouts
+        // are disabled. Legacy zero/zero requests retain pass-through behavior.
+        if deadline.is_none() && self.non_streaming_timeout.is_zero() && !policy_enabled {
             return Ok(response);
         }
 
         let status = response.status();
         let headers = response.headers().clone();
-        let body_timeout = self.non_streaming_timeout;
-        let body = tokio::time::timeout(
-            body_timeout,
-            response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES),
-        )
-        .await
-        .map_err(|_| {
-            ProxyError::Timeout(format!(
-                "响应体读取超时: {}s（上游发完响应头后 body 未到达）",
-                body_timeout.as_secs()
-            ))
-        })??;
+        let body = match Self::remaining_attempt_time(deadline) {
+            Some(remaining) => tokio::time::timeout(
+                remaining,
+                response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES),
+            )
+            .await
+            .map_err(|_| {
+                ProxyError::Timeout(
+                    "Provider attempt deadline exceeded while reading response body".to_string(),
+                )
+            })??,
+            None if policy_enabled => response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES).await?,
+            None => {
+                let body_timeout = self.non_streaming_timeout;
+                tokio::time::timeout(
+                    body_timeout,
+                    response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES),
+                )
+                .await
+                .map_err(|_| {
+                    ProxyError::Timeout(format!(
+                        "响应体读取超时: {}s（上游发完响应头后 body 未到达）",
+                        body_timeout.as_secs()
+                    ))
+                })??
+            }
+        };
 
         Ok(ProxyResponse::buffered(status, headers, body))
+    }
+    async fn read_response_body_with_deadline(
+        response: ProxyResponse,
+        deadline: Option<tokio::time::Instant>,
+        context: &str,
+    ) -> Result<Bytes, ProxyError> {
+        let read = response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES);
+        match Self::remaining_attempt_time(deadline) {
+            Some(remaining) => tokio::time::timeout(remaining, read).await.map_err(|_| {
+                ProxyError::Timeout(format!(
+                    "Provider attempt deadline exceeded while {context}"
+                ))
+            })?,
+            None => read.await,
+        }
     }
 
     /// Some Anthropic-compatible gateways return an Anthropic error envelope with
@@ -2407,11 +2494,17 @@ impl RequestForwarder {
     async fn validate_codex_anthropic_success_response(
         &self,
         response: ProxyResponse,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<ProxyResponse, ProxyError> {
         let status = response.status();
         let headers = response.headers().clone();
         let encoding = get_content_encoding(&headers);
-        let raw = response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES).await?;
+        let raw = Self::read_response_body_with_deadline(
+            response,
+            deadline,
+            "validating Anthropic success response",
+        )
+        .await?;
         let decoded = match encoding {
             Some(encoding) => {
                 match decompress_body_with_limit(&encoding, &raw, MAX_RESPONSE_BODY_BYTES) {
@@ -2434,11 +2527,17 @@ impl RequestForwarder {
     async fn validate_responses_success_response(
         &self,
         response: ProxyResponse,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<ProxyResponse, ProxyError> {
         let status = response.status();
         let headers = response.headers().clone();
         let encoding = get_content_encoding(&headers);
-        let raw = response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES).await?;
+        let raw = Self::read_response_body_with_deadline(
+            response,
+            deadline,
+            "validating Responses success response",
+        )
+        .await?;
         let decoded = match encoding {
             Some(encoding) => {
                 match decompress_body_with_limit(&encoding, &raw, MAX_RESPONSE_BODY_BYTES) {
@@ -2461,6 +2560,7 @@ impl RequestForwarder {
     async fn validate_responses_stream_start(
         &self,
         response: ProxyResponse,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<ProxyResponse, ProxyError> {
         const MAX_PRIME_BYTES: usize = 256 * 1024;
 
@@ -2472,7 +2572,16 @@ impl RequestForwarder {
         let mut utf8_remainder = Vec::new();
 
         loop {
-            let next = if self.streaming_first_byte_timeout.is_zero() {
+            let next = if let Some(remaining) = Self::remaining_attempt_time(deadline) {
+                tokio::time::timeout(remaining, stream.next())
+                    .await
+                    .map_err(|_| {
+                        ProxyError::Timeout(
+                            "Provider attempt deadline exceeded while priming Responses stream"
+                                .to_string(),
+                        )
+                    })?
+            } else if self.streaming_first_byte_timeout.is_zero() {
                 stream.next().await
             } else {
                 tokio::time::timeout(self.streaming_first_byte_timeout, stream.next())
@@ -2543,24 +2652,42 @@ impl RequestForwarder {
     async fn prime_streaming_response(
         &self,
         response: ProxyResponse,
+        deadline: Option<tokio::time::Instant>,
+        policy_enabled: bool,
     ) -> Result<ProxyResponse, ProxyError> {
-        if self.streaming_first_byte_timeout.is_zero() {
+        if deadline.is_none() && self.streaming_first_byte_timeout.is_zero() && !policy_enabled {
             return Ok(response);
         }
 
         let status = response.status();
         let headers = response.headers().clone();
-        let timeout = self.streaming_first_byte_timeout;
         let mut stream = Box::pin(response.bytes_stream());
-
-        let first = tokio::time::timeout(timeout, stream.next())
-            .await
-            .map_err(|_| {
-                ProxyError::Timeout(format!(
-                    "流式响应首包超时: {}s（上游已返回响应头但未返回数据）",
-                    timeout.as_secs()
-                ))
-            })?;
+        let first = if let Some(remaining) = Self::remaining_attempt_time(deadline) {
+            if remaining.is_zero() {
+                return Err(ProxyError::Timeout(
+                    "Provider attempt deadline exceeded before first stream chunk".to_string(),
+                ));
+            }
+            tokio::time::timeout(remaining, stream.next())
+                .await
+                .map_err(|_| {
+                    ProxyError::Timeout(
+                        "Provider attempt deadline exceeded before first stream chunk".to_string(),
+                    )
+                })?
+        } else if self.streaming_first_byte_timeout.is_zero() && policy_enabled {
+            stream.next().await
+        } else {
+            let timeout = self.streaming_first_byte_timeout;
+            tokio::time::timeout(timeout, stream.next())
+                .await
+                .map_err(|_| {
+                    ProxyError::Timeout(format!(
+                        "流式响应首包超时: {}s（上游已返回响应头但未返回数据）",
+                        timeout.as_secs()
+                    ))
+                })?
+        };
 
         let Some(first) = first else {
             return Err(ProxyError::ForwardFailed(
@@ -3330,6 +3457,24 @@ fn should_force_identity_encoding(
     is_streaming_request(endpoint, body, headers)
 }
 
+fn is_connect_failure_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "上游连接失败",
+        "tcp connect failed",
+        "proxy tcp connect failed",
+        "tls handshake failed",
+        "proxy tls handshake failed",
+        "failed to connect",
+        "trying to connect",
+        "connection refused",
+        "connection reset",
+        "network is unreachable",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
 fn map_reqwest_send_error(error: reqwest::Error) -> ProxyError {
     if error.is_timeout() {
         ProxyError::Timeout(format!("上游请求超时: {}", error.without_url()))
@@ -3661,6 +3806,33 @@ mod tests {
             max_attempts: 1,
         }
     }
+    #[test]
+    fn finite_provider_attempt_indices_match_retry_count() {
+        let policy = crate::provider::ProviderRetryPolicy {
+            retry_count: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            RequestForwarder::provider_attempt_indices(policy).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn unlimited_provider_attempt_indices_continue_without_finite_budget() {
+        let policy = crate::provider::ProviderRetryPolicy {
+            unlimited_retries: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            RequestForwarder::provider_attempt_indices(policy)
+                .take(4)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
 
     #[test]
     fn single_provider_retryable_log_uses_single_provider_code() {
@@ -3917,7 +4089,7 @@ mod tests {
         );
 
         let prepared = forwarder
-            .prepare_success_response_for_failover(response, false)
+            .prepare_success_response_for_failover(response, false, None, false)
             .await
             .expect("response should be buffered");
 
@@ -3942,7 +4114,7 @@ mod tests {
         );
 
         let err = match forwarder
-            .prepare_success_response_for_failover(response, false)
+            .prepare_success_response_for_failover(response, false, None, false)
             .await
         {
             Ok(_) => panic!("body read errors should fail the attempt"),
@@ -3965,7 +4137,7 @@ mod tests {
         );
 
         let prepared = forwarder
-            .prepare_success_response_for_failover(response, true)
+            .prepare_success_response_for_failover(response, true, None, false)
             .await
             .expect("stream should be primed");
 
@@ -3990,7 +4162,7 @@ mod tests {
         );
 
         let err = match forwarder
-            .prepare_success_response_for_failover(response, true)
+            .prepare_success_response_for_failover(response, true, None, false)
             .await
         {
             Ok(_) => panic!("first chunk errors should fail the attempt"),

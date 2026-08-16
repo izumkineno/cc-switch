@@ -93,6 +93,14 @@ import {
   type PricingModelSourceOption,
 } from "./ProviderAdvancedConfig";
 import {
+  createDefaultProviderRetryPolicyDraft,
+  isProviderRetryPolicySupportedApp,
+  parseProviderRetryPolicy,
+  providerRetryPolicyToDraft,
+  type ProviderRetryPolicyDraft,
+  type ProviderRetryPolicyErrors,
+} from "@/utils/providerRetryPolicy";
+import {
   useProviderCategory,
   useApiKeyState,
   useBaseUrlState,
@@ -384,6 +392,14 @@ function ProviderFormFull({
       initialData?.meta?.pricingModelSource,
     ),
   }));
+  const [retryPolicyDraft, setRetryPolicyDraft] =
+    useState<ProviderRetryPolicyDraft>(() =>
+      initialData
+        ? providerRetryPolicyToDraft(initialData.meta?.retryPolicy)
+        : createDefaultProviderRetryPolicyDraft(),
+    );
+  const [retryPolicyErrors, setRetryPolicyErrors] =
+    useState<ProviderRetryPolicyErrors>({});
 
   const { category } = useProviderCategory({
     appId,
@@ -415,6 +431,10 @@ function ProviderFormFull({
         initialData?.meta?.pricingModelSource,
       ),
     });
+    setRetryPolicyDraft(
+      providerRetryPolicyToDraft(initialData?.meta?.retryPolicy),
+    );
+    setRetryPolicyErrors({});
     setSelectedGitHubAccountId(
       resolveManagedAccountId(initialData?.meta, "github_copilot"),
     );
@@ -637,6 +657,13 @@ function ProviderFormFull({
       formatRequestOverrideObject(
         initialData?.meta?.localProxyRequestOverrides?.body,
       ),
+  );
+  const handleRetryPolicyChange = useCallback(
+    (value: ProviderRetryPolicyDraft) => {
+      setRetryPolicyDraft(value);
+      setRetryPolicyErrors({});
+    },
+    [],
   );
 
   const {
@@ -1119,8 +1146,26 @@ function ProviderFormFull({
 
   const shouldApplyLocalProxyRequestOverrides =
     (appId === "claude" || appId === "codex") && category !== "official";
+  const parseRetryPolicyForSubmit = () => {
+    if (!isProviderRetryPolicySupportedApp(appId)) return undefined;
+    const result = parseProviderRetryPolicy(retryPolicyDraft);
+    if (!result.success || !result.policy) {
+      setRetryPolicyErrors(result.errors);
+      toast.error(
+        t("providerRetryPolicy.invalid", {
+          defaultValue: "Please correct the supplier retry settings.",
+        }),
+      );
+      return null;
+    }
+    setRetryPolicyErrors({});
+    return result.policy;
+  };
 
   const handleSubmit = async (values: ProviderFormData) => {
+    const retryPolicy = parseRetryPolicyForSubmit();
+    if (retryPolicy === null) return;
+
     const overridesResult = shouldApplyLocalProxyRequestOverrides
       ? buildLocalProxyRequestOverrides(
           localProxyHeadersOverride,
@@ -1496,6 +1541,8 @@ function ProviderFormFull({
     values: ProviderFormData,
     overridesResult: LocalProxyRequestOverridesBuildResult,
   ) => {
+    const retryPolicy = parseRetryPolicyForSubmit();
+    if (retryPolicy === null) return;
     if (overridesResult.error) {
       toast.error(
         t("providerForm.localProxyRequestOverridesInvalid", {
@@ -1796,6 +1843,9 @@ function ProviderFormFull({
         pricingConfig.enabled && pricingConfig.pricingModelSource !== "inherit"
           ? pricingConfig.pricingModelSource
           : undefined,
+      ...(isProviderRetryPolicySupportedApp(appId) && retryPolicy
+        ? { retryPolicy }
+        : {}),
       apiFormat:
         appId === "claude" && category !== "official"
           ? isXaiOauthProvider
@@ -2798,6 +2848,21 @@ function ProviderFormFull({
               <ProviderAdvancedConfig
                 pricingConfig={pricingConfig}
                 onPricingConfigChange={setPricingConfig}
+                retryPolicy={
+                  isProviderRetryPolicySupportedApp(appId)
+                    ? retryPolicyDraft
+                    : undefined
+                }
+                onRetryPolicyChange={
+                  isProviderRetryPolicySupportedApp(appId)
+                    ? handleRetryPolicyChange
+                    : undefined
+                }
+                retryPolicyErrors={
+                  isProviderRetryPolicySupportedApp(appId)
+                    ? retryPolicyErrors
+                    : undefined
+                }
               />
             )}
 

@@ -168,6 +168,21 @@ export interface LocalProxyRequestOverrides {
   body?: Record<string, unknown>;
 }
 
+/**
+ * Supplier-scoped retry controls for requests handled by the local proxy.
+ *
+ * `retryCount` is the number of retries after the first attempt unless
+ * `unlimitedRetries` is enabled. All time values are integer seconds. Zero
+ * disables that part of the policy; an all-zero policy with unlimited retries
+ * disabled is explicitly disabled.
+ */
+export interface ProviderRetryPolicy {
+  retryCount: number;
+  perAttemptTimeoutSeconds: number;
+  retryWaitSeconds: number;
+  unlimitedRetries: boolean;
+}
+
 // 供应商元数据（字段名与后端一致，保持 snake_case）
 export interface ProviderMeta {
   // 自定义端点：以 URL 为键，值为端点信息
@@ -227,6 +242,11 @@ export interface ProviderMeta {
   customUserAgent?: string;
   // Local proxy request overrides. Only applied by the local proxy after route transforms.
   localProxyRequestOverrides?: LocalProxyRequestOverrides;
+  /**
+   * Supplier-scoped same-provider retry policy. The object is optional so
+   * legacy provider metadata without retry settings remains valid.
+   */
+  retryPolicy?: ProviderRetryPolicy;
   // Whether this provider is currently projected into an additive app's live config.
   liveConfigManaged?: boolean;
   // 供应商类型（用于识别 Copilot 等特殊供应商）

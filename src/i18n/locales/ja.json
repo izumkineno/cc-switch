@@ -1490,6 +1490,30 @@
     "pricingModelSourceResponse": "レスポンスモデル",
     "pricingModelSourceHint": "リクエストモデルまたはレスポンスモデルで価格を照合するかを選択"
   },
+  "providerRetryPolicy": {
+    "title": "プロバイダーのリトライ",
+    "description": "既存のフェイルオーバーの前に、同じプロバイダーでリトライ可能な失敗を再試行します。",
+    "semantics": "リトライ回数は最初の試行後に行う再試行回数です。無制限リトライを有効にすると、この回数は無視されます。秒数を示す時間値は秒単位で、0 はその設定を無効にします。",
+    "unlimitedRetriesLabel": "無制限リトライ",
+    "unlimitedRetriesHint": "成功するか、再試行できないエラーになるか、キャンセルされるまで、再試行可能な失敗を再試行します。有効にするとリトライ回数は無視されます。",
+    "retryCountLabel": "最初の試行後のリトライ回数",
+    "retryCountHint": "0 は同じプロバイダーへのリトライを無効にします。許容範囲は {{min}}～{{max}} です。",
+    "perAttemptTimeoutLabel": "試行ごとのタイムアウト",
+    "perAttemptTimeoutHint": "0 はこの設定を無効にします。許容範囲は {{min}}～{{max}} 秒です。",
+    "retryWaitLabel": "リトライ間隔",
+    "retryWaitHint": "0 はこの設定を無効にします。許容範囲は {{min}}～{{max}} 秒です。",
+    "seconds": "秒",
+    "disabledHint": "無制限リトライを無効にし、3 つの数値がすべて 0 の場合、プロバイダーのリトライは無効ですが、最初の試行は 1 回実行されます。",
+    "failoverWarning": "アプリのフェイルオーバーと無制限リトライを無効にすると、上流への最大試行回数は乗算されます：（アプリのフェイルオーバーリトライ回数 + 1）×（プロバイダーのリトライ回数 + 1）。無制限リトライには有限の試行回数上限がありません。",
+    "invalid": "プロバイダーのリトライ設定を修正してください。",
+    "errors": {
+      "required": "値を入力してください。",
+      "integer": "0 以上の整数を入力してください。",
+      "retryCountRange": "{{min}}～{{max}} の範囲で入力してください。",
+      "perAttemptTimeoutSecondsRange": "{{min}}～{{max}} 秒の範囲で入力してください。",
+      "retryWaitSecondsRange": "{{min}}～{{max}} 秒の範囲で入力してください。"
+    }
+  },
   "codexConfig": {
     "authJson": "auth.json (JSON) *",
     "authJsonPlaceholder": "{\n  \"OPENAI_API_KEY\": \"sk-your-api-key-here\"\n}",
