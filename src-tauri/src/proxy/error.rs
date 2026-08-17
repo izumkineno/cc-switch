@@ -57,6 +57,10 @@ pub enum ProxyError {
     #[allow(dead_code)]
     #[error("格式转换错误: {0}")]
     TransformError(String),
+    /// 上游返回 HTTP 2xx，但响应体声明生成失败。保留原始响应体仅用于解析 usage；
+    /// 对外错误消息仍只暴露 `message`，避免把响应体意外写入日志或客户端。
+    #[error("格式转换错误: {message}")]
+    TransformErrorWithBody { message: String, body: String },
 
     #[allow(dead_code)]
     #[error("无效的请求: {0}")]
@@ -147,7 +151,7 @@ impl IntoResponse for ProxyError {
                         (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
                     }
                     ProxyError::ConfigError(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-                    ProxyError::TransformError(_) => {
+                    ProxyError::TransformError(_) | ProxyError::TransformErrorWithBody { .. } => {
                         (StatusCode::UNPROCESSABLE_ENTITY, self.to_string())
                     }
                     ProxyError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),

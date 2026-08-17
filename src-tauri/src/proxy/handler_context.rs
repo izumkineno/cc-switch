@@ -222,9 +222,16 @@ impl RequestContext {
         } else {
             0
         };
+        let usage_logging_enabled = state
+            .config
+            .try_read()
+            .map(|config| config.enable_logging)
+            .unwrap_or(true);
 
         RequestForwarder::new(
             state.provider_router.clone(),
+            state.db.clone(),
+            usage_logging_enabled,
             non_streaming_timeout,
             state.status.clone(),
             state.current_providers.clone(),
