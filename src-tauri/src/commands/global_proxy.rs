@@ -157,6 +157,36 @@ pub async fn test_proxy_url(url: String) -> Result<ProxyTestResult, String> {
     })
 }
 
+fn selected_runtime_proxy_url<'a>(
+    enabled: bool,
+    saved_url: Option<&'a str>,
+) -> Result<Option<&'a str>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    saved_url
+        .filter(|url| !url.trim().is_empty())
+        .map(Some)
+        .ok_or_else(|| "No global outbound proxy is configured".to_string())
+}
+
+/// 临时启用或停用当前进程的全局出站代理。
+///
+/// 保存的代理 URL 不会被删除；应用重启时仍按已保存配置启用代理。
+#[tauri::command]
+pub fn set_upstream_proxy_enabled(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<UpstreamProxyStatus, String> {
+    let saved_url = state.db.get_global_proxy_url().map_err(|e| e.to_string())?;
+    let runtime_url = selected_runtime_proxy_url(enabled, saved_url.as_deref())?;
+    http_client::apply_proxy(runtime_url)?;
+    Ok(UpstreamProxyStatus {
+        enabled: runtime_url.is_some(),
+        proxy_url: runtime_url.map(ToString::to_string),
+    })
+}
+
 /// 获取当前出站代理状态
 ///
 /// 返回当前是否启用了出站代理以及代理 URL。
@@ -244,4 +274,23 @@ pub async fn scan_local_proxies() -> Vec<DetectedProxy> {
     })
     .await
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_runtime_proxy_url;
+
+    #[test]
+    fn runtime_proxy_toggle_preserves_saved_url_for_reenable() {
+        let saved = "http://127.0.0.1:7890";
+        assert_eq!(
+            selected_runtime_proxy_url(false, Some(saved)).unwrap(),
+            None
+        );
+        assert_eq!(
+            selected_runtime_proxy_url(true, Some(saved)).unwrap(),
+            Some(saved)
+        );
+        assert!(selected_runtime_proxy_url(true, None).is_err());
+    }
 }

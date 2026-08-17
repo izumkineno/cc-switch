@@ -76,6 +76,23 @@ export async function getUpstreamProxyStatus(): Promise<UpstreamProxyStatus> {
 }
 
 /**
+ * 临时启用或停用当前进程的全局出站代理。
+ *
+ * 保存的代理 URL 不会被清除；重新启用时继续使用已保存地址。
+ */
+export async function setUpstreamProxyEnabled(
+  enabled: boolean,
+): Promise<UpstreamProxyStatus> {
+  try {
+    return await invoke<UpstreamProxyStatus>("set_upstream_proxy_enabled", {
+      enabled,
+    });
+  } catch (error) {
+    throw new Error(typeof error === "string" ? error : String(error));
+  }
+}
+
+/**
  * 扫描本地代理
  *
  * @returns 检测到的代理列表
