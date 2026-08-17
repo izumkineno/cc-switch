@@ -6,6 +6,7 @@ pub mod env_checker;
 pub mod env_manager;
 pub mod mcp;
 pub mod model_fetch;
+pub mod model_test;
 pub mod model_pricing;
 pub mod omo;
 pub mod pi_prompt_files;
