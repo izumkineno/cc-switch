@@ -12,6 +12,7 @@ import {
   setGlobalProxyUrl,
   testProxyUrl,
   getUpstreamProxyStatus,
+  setUpstreamProxyEnabled,
   scanLocalProxies,
   type ProxyTestResult,
   type UpstreamProxyStatus,
@@ -21,11 +22,12 @@ import {
 /**
  * 获取全局代理 URL
  */
-export function useGlobalProxyUrl() {
+export function useGlobalProxyUrl(enabled = true) {
   return useQuery({
     queryKey: ["globalProxyUrl"],
     queryFn: getGlobalProxyUrl,
     staleTime: 30 * 1000, // 30秒内不重新获取，避免展开时闪烁
+    enabled,
   });
 }
 
@@ -83,10 +85,23 @@ export function useTestProxy() {
 /**
  * 获取当前出站代理状态
  */
-export function useUpstreamProxyStatus() {
+export function useUpstreamProxyStatus(enabled = true) {
   return useQuery<UpstreamProxyStatus>({
     queryKey: ["upstreamProxyStatus"],
     queryFn: getUpstreamProxyStatus,
+    enabled,
+  });
+}
+
+/** 临时切换当前进程的全局出站代理，不修改已保存的代理 URL。 */
+export function useSetUpstreamProxyEnabled() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: setUpstreamProxyEnabled,
+    onSuccess: (status: UpstreamProxyStatus) => {
+      queryClient.setQueryData(["upstreamProxyStatus"], status);
+    },
   });
 }
 

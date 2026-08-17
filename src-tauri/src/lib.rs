@@ -1649,6 +1649,7 @@ pub fn run() {
             commands::set_global_proxy_url,
             commands::test_proxy_url,
             commands::get_upstream_proxy_status,
+            commands::set_upstream_proxy_enabled,
             commands::scan_local_proxies,
             // Window theme control
             commands::set_window_theme,
