@@ -32,6 +32,7 @@ import {
 } from "@/hooks/useHermes";
 import { useStreamCheck } from "@/hooks/useStreamCheck";
 import { ProviderCard } from "@/components/providers/ProviderCard";
+import { ProviderModelTestDialog } from "@/components/providers/ProviderModelTestDialog";
 import { ProviderEmptyState } from "@/components/providers/ProviderEmptyState";
 import {
   useAutoFailoverEnabled,
@@ -94,6 +95,8 @@ export function ProviderList({
   onSetAsDefault,
 }: ProviderListProps) {
   const { t } = useTranslation();
+  const [modelTestProvider, setModelTestProvider] =
+    useState<Provider | null>(null);
   const { checkProvider, isChecking } = useStreamCheck(appId);
   const { sortedProviders, sensors, handleDragEnd } = useDragSort(
     providers,
@@ -229,6 +232,10 @@ export function ProviderList({
     },
     [checkProvider],
   );
+
+  const handleModelTest = useCallback((provider: Provider) => {
+    setModelTestProvider(provider);
+  }, []);
 
   // Import current live config as default provider
   const queryClient = useQueryClient();
@@ -477,6 +484,10 @@ export function ProviderList({
                 onOpenWebsite={onOpenWebsite}
                 onOpenTerminal={onOpenTerminal}
                 onTest={handleTest}
+                onModelTest={handleModelTest}
+                isModelTesting={
+                  modelTestProvider?.id === provider.id
+                }
                 isTesting={isChecking(provider.id)}
                 isProxyRunning={supportsFailover && isProxyRunning}
                 isProxyTakeover={supportsFailover && isProxyTakeover}
@@ -612,6 +623,14 @@ export function ProviderList({
       ) : (
         renderProviderList()
       )}
+      <ProviderModelTestDialog
+        open={modelTestProvider !== null}
+        onOpenChange={(open) => {
+          if (!open) setModelTestProvider(null);
+        }}
+        appType={appId}
+        provider={modelTestProvider}
+      />
     </div>
   );
 }
@@ -634,7 +653,9 @@ interface SortableProviderCardProps {
   onOpenWebsite: (url: string) => void;
   onOpenTerminal?: (provider: Provider) => void;
   onTest?: (provider: Provider) => void;
+  onModelTest?: (provider: Provider) => void;
   isTesting: boolean;
+  isModelTesting: boolean;
   isProxyRunning: boolean;
   isProxyTakeover: boolean;
   isAutoFailoverEnabled: boolean;
@@ -667,7 +688,9 @@ function SortableProviderCard({
   onOpenWebsite,
   onOpenTerminal,
   onTest,
+  onModelTest,
   isTesting,
+  isModelTesting,
   isProxyRunning,
   isProxyTakeover,
   isAutoFailoverEnabled,
@@ -716,6 +739,8 @@ function SortableProviderCard({
         onOpenWebsite={onOpenWebsite}
         onOpenTerminal={onOpenTerminal}
         onTest={onTest}
+        onModelTest={onModelTest}
+        isModelTesting={isModelTesting}
         isTesting={isTesting}
         isProxyRunning={isProxyRunning}
         isProxyTakeover={isProxyTakeover}

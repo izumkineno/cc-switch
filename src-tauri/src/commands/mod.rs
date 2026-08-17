@@ -15,6 +15,8 @@ mod import_export;
 mod mcp;
 mod misc;
 mod model_fetch;
+mod model_test;
+
 mod omo;
 mod openclaw;
 mod pi;
@@ -53,6 +55,7 @@ pub use mcp::*;
 pub use misc::*;
 pub use model_fetch::*;
 pub use omo::*;
+pub use model_test::*;
 pub use openclaw::*;
 pub(crate) use pi::*;
 pub use plugin::*;
