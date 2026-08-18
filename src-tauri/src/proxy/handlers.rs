@@ -2014,7 +2014,9 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         ProxyError::MaxRetriesExceeded => "cc_switch_max_retries_exceeded",
         ProxyError::ProviderUnhealthy(_) => "cc_switch_provider_unhealthy",
         ProxyError::ConfigError(_) => "cc_switch_config_error",
-        ProxyError::TransformError(_) => "cc_switch_transform_error",
+        ProxyError::TransformError(_) | ProxyError::TransformErrorWithBody { .. } => {
+            "cc_switch_transform_error"
+        }
         ProxyError::InvalidRequest(_) => "cc_switch_invalid_request",
         ProxyError::AuthError(_) => "cc_switch_auth_error",
         ProxyError::UpstreamError { .. } => "cc_switch_upstream_error",

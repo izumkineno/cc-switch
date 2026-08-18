@@ -20,6 +20,7 @@ use super::{
         normalize_thinking_type, rectify_anthropic_request, should_rectify_thinking_signature,
     },
     types::{CopilotOptimizerConfig, OptimizerConfig, ProxyStatus, RectifierConfig},
+    usage::{TokenUsage, UsageLogger},
     ProxyError,
 };
 use crate::commands::{CodexOAuthState, CopilotAuthState, XaiOAuthState};
@@ -27,6 +28,7 @@ use crate::proxy::providers::copilot_auth::CopilotAuthManager;
 use crate::proxy::providers::xai_oauth_auth::XaiOAuthManager;
 use crate::{
     app_config::AppType,
+    database::Database,
     provider::{LocalProxyRequestOverrides, Provider, ProviderRetryPolicy},
 };
 use bytes::Bytes;
@@ -281,6 +283,10 @@ enum ProviderRepairOutcome {
 pub struct RequestForwarder {
     /// 共享的 ProviderRouter（持有熔断器状态）
     router: Arc<ProviderRouter>,
+    /// 失败上游尝试的 token usage 与普通代理日志写入同一数据库。
+    db: Arc<Database>,
+    /// 请求开始时快照的 usage logging 开关。
+    usage_logging_enabled: bool,
     status: Arc<RwLock<ProxyStatus>>,
     current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
     gemini_shadow: Arc<GeminiShadowStore>,
@@ -362,6 +368,8 @@ impl RequestForwarder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         router: Arc<ProviderRouter>,
+        db: Arc<Database>,
+        usage_logging_enabled: bool,
         non_streaming_timeout: u64,
         status: Arc<RwLock<ProxyStatus>>,
         current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
@@ -384,6 +392,8 @@ impl RequestForwarder {
         let max_attempts = (max_retries as usize).saturating_add(1);
         Self {
             router,
+            db,
+            usage_logging_enabled,
             status,
             current_providers,
             gemini_shadow,
@@ -1161,12 +1171,109 @@ impl RequestForwarder {
         ProviderRepairOutcome::NotNeeded
     }
 
+    fn record_failed_attempt_usage(
+        &self,
+        app_type: &AppType,
+        provider: &Provider,
+        request_model: &str,
+        error: &ProxyError,
+        latency_ms: u64,
+        is_streaming: bool,
+    ) {
+        if !self.usage_logging_enabled {
+            return;
+        }
+        let Some(usage) = parse_failed_attempt_usage(error) else {
+            return;
+        };
+        let model = usage
+            .model
+            .clone()
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| request_model.to_string());
+        let provider_type = ProviderType::from_app_type_and_config(app_type, provider)
+            .map(|provider_type| provider_type.as_str().to_string());
+        let session_id = (!self.session_id.is_empty()).then(|| self.session_id.clone());
+        let logger = UsageLogger::new(&self.db);
+        if let Err(error) = logger.log_error_with_usage_context(
+            format!("provider-attempt:{}", uuid::Uuid::new_v4()),
+            provider.id.clone(),
+            app_type.as_str().to_string(),
+            model,
+            request_model.to_string(),
+            usage,
+            super::error_mapper::map_proxy_error_to_status(error),
+            summarize_proxy_error(error),
+            latency_ms,
+            is_streaming,
+            session_id,
+            provider_type,
+        ) {
+            log::warn!(
+                "[{}] 记录失败 Provider 尝试的 token usage 失败: provider_id={}, error={error}",
+                app_type.as_str(),
+                provider.id
+            );
+        }
+    }
+
+    /// 转发单次上游尝试，并在失败响应携带 usage 时记录实际 token 消耗。
+    #[allow(clippy::too_many_arguments)]
+    async fn forward(
+        &self,
+        app_type: &AppType,
+        method: &http::Method,
+        provider: &Provider,
+        endpoint: &str,
+        body: &Value,
+        headers: &axum::http::HeaderMap,
+        extensions: &Extensions,
+        adapter: &dyn ProviderAdapter,
+        pinned: &mut ProviderExecutionPin,
+        attempt_timeout: std::time::Duration,
+        policy_enabled: bool,
+    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        let started_at = tokio::time::Instant::now();
+        let is_streaming = is_streaming_request(endpoint, body, headers);
+        let request_model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or("unknown");
+        let result = self
+            .forward_once(
+                app_type,
+                method,
+                provider,
+                endpoint,
+                body,
+                headers,
+                extensions,
+                adapter,
+                pinned,
+                attempt_timeout,
+                policy_enabled,
+            )
+            .await;
+        if let Err(error) = &result {
+            self.record_failed_attempt_usage(
+                app_type,
+                provider,
+                request_model,
+                error,
+                started_at.elapsed().as_millis() as u64,
+                is_streaming,
+            );
+        }
+        result
+    }
+
     /// 转发单个请求（使用适配器）
     ///
     /// 成功时返回 `(response, claude_api_format, outbound_model)`，其中
     /// `outbound_model` 是最终发往上游的模型名（所有映射/改写之后）。
     #[allow(clippy::too_many_arguments)]
-    async fn forward(
+    async fn forward_once(
         &self,
         app_type: &AppType,
         method: &http::Method,
@@ -2521,9 +2628,10 @@ impl RequestForwarder {
         };
 
         if let Some(message) = codex_anthropic_error_envelope_message(&decoded) {
-            return Err(ProxyError::TransformError(format!(
-                "Anthropic upstream returned a 2xx error envelope: {message}"
-            )));
+            return Err(ProxyError::TransformErrorWithBody {
+                message: format!("Anthropic upstream returned a 2xx error envelope: {message}"),
+                body: String::from_utf8_lossy(&decoded).into_owned(),
+            });
         }
 
         Ok(ProxyResponse::buffered(status, headers, raw))
@@ -2554,9 +2662,10 @@ impl RequestForwarder {
         };
 
         if let Some(message) = responses_error_envelope_message(&decoded) {
-            return Err(ProxyError::TransformError(format!(
-                "Responses upstream returned a 2xx failure: {message}"
-            )));
+            return Err(ProxyError::TransformErrorWithBody {
+                message: format!("Responses upstream returned a 2xx failure: {message}"),
+                body: String::from_utf8_lossy(&decoded).into_owned(),
+            });
         }
 
         Ok(ProxyResponse::buffered(status, headers, raw))
@@ -2851,7 +2960,9 @@ impl RequestForwarder {
             },
             // Provider 级配置/转换问题：换一个 Provider 可能就能成功
             ProxyError::ConfigError(_) => ErrorCategory::Retryable,
-            ProxyError::TransformError(_) => ErrorCategory::Retryable,
+            ProxyError::TransformError(_) | ProxyError::TransformErrorWithBody { .. } => {
+                ErrorCategory::Retryable
+            }
             ProxyError::AuthError(_) => ErrorCategory::Retryable,
             ProxyError::StreamIdleTimeout(_) => ErrorCategory::Retryable,
             // 无可用供应商：所有供应商都试过了，无法重试
@@ -2862,10 +2973,45 @@ impl RequestForwarder {
     }
 }
 
-/// 从 ProxyError 中提取错误消息
+/// 按上游 wire format 解析非流式 usage。
+fn parse_usage_value(value: &Value) -> Option<TokenUsage> {
+    if value.get("usageMetadata").is_some() {
+        return TokenUsage::from_gemini_response(value);
+    }
+
+    let usage = value.get("usage")?;
+    if usage.get("prompt_tokens").is_some() {
+        return TokenUsage::from_openai_response(value);
+    }
+    if usage.get("cache_read_input_tokens").is_some()
+        || usage.get("cache_creation_input_tokens").is_some()
+    {
+        return TokenUsage::from_claude_response(value);
+    }
+    TokenUsage::from_codex_response_auto(value).or_else(|| TokenUsage::from_claude_response(value))
+}
+
+fn parse_failed_attempt_usage(error: &ProxyError) -> Option<TokenUsage> {
+    let body = match error {
+        ProxyError::UpstreamError {
+            body: Some(body), ..
+        }
+        | ProxyError::TransformErrorWithBody { body, .. } => body,
+        _ => return None,
+    };
+    let value: Value = serde_json::from_str(body).ok()?;
+    std::iter::once(&value)
+        .chain(value.get("response"))
+        .chain(value.get("data"))
+        .find_map(parse_usage_value)
+        .filter(TokenUsage::has_billable_tokens)
+}
+
+/// 从 ProxyError 中提取错误消息，供同供应商修复判定使用。
 fn extract_error_message(error: &ProxyError) -> Option<String> {
     match error {
         ProxyError::UpstreamError { body, .. } => body.clone(),
+        ProxyError::TransformErrorWithBody { body, .. } => Some(body.clone()),
         _ => Some(error.to_string()),
     }
 }
@@ -2944,7 +3090,8 @@ fn summarize_proxy_error(error: &ProxyError) -> String {
         ProxyError::ForwardFailed(message) => {
             format!("请求转发失败: {}", summarize_text_for_log(message, 180))
         }
-        ProxyError::TransformError(message) => {
+        ProxyError::TransformError(message)
+        | ProxyError::TransformErrorWithBody { message, .. } => {
             format!("响应转换失败: {}", summarize_text_for_log(message, 180))
         }
         ProxyError::ConfigError(message) => {
@@ -3163,9 +3310,10 @@ fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError
     }
     let _: Value = serde_json::from_str(trimmed).ok()?;
     if let Some(message) = responses_error_envelope_message(trimmed.as_bytes()) {
-        return Some(Err(ProxyError::TransformError(format!(
-            "Responses upstream returned a 2xx failure: {message}"
-        ))));
+        return Some(Err(ProxyError::TransformErrorWithBody {
+            message: format!("Responses upstream returned a 2xx failure: {message}"),
+            body: trimmed.to_string(),
+        }));
     }
     Some(Ok(()))
 }
@@ -3186,7 +3334,8 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
     if data_lines.is_empty() {
         return None;
     }
-    let value: Value = match serde_json::from_str(&data_lines.join("\n")) {
+    let data = data_lines.join("\n");
+    let value: Value = match serde_json::from_str(&data) {
         Ok(value) => value,
         Err(_) => return None,
     };
@@ -3214,9 +3363,10 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
             .or_else(|| error.get("code").and_then(Value::as_str))
             .or_else(|| response.get("status").and_then(Value::as_str))
             .unwrap_or("upstream_error");
-        return Some(Err(ProxyError::TransformError(format!(
-            "Responses upstream {error_type}: {message}"
-        ))));
+        return Some(Err(ProxyError::TransformErrorWithBody {
+            message: format!("Responses upstream {error_type}: {message}"),
+            body: data,
+        }));
     }
 
     match event {
@@ -3232,9 +3382,10 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
                 .and_then(Value::as_str)
                 .or_else(|| error.get("code").and_then(Value::as_str))
                 .unwrap_or("upstream_error");
-            Some(Err(ProxyError::TransformError(format!(
-                "Responses upstream {error_type}: {message}"
-            ))))
+            Some(Err(ProxyError::TransformErrorWithBody {
+                message: format!("Responses upstream {error_type}: {message}"),
+                body: data,
+            }))
         }
         "response.created" | "response.in_progress" | "response.queued" => None,
         "" => None,
@@ -3818,6 +3969,7 @@ fn value_for_log(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::database::Database;
+    use crate::error::AppError;
     use crate::provider::LocalProxyRequestOverrides;
     use axum::http::header::{HeaderValue, ACCEPT};
     use axum::http::HeaderMap;
@@ -3826,6 +3978,7 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_provider_with_type(provider_type: Option<&str>) -> Provider {
         Provider {
@@ -3855,6 +4008,8 @@ mod tests {
 
         RequestForwarder {
             router: Arc::new(ProviderRouter::new(db.clone())),
+            db: db.clone(),
+            usage_logging_enabled: true,
             status: Arc::new(RwLock::new(ProxyStatus::default())),
             current_providers: Arc::new(RwLock::new(HashMap::new())),
             gemini_shadow: Arc::new(GeminiShadowStore::new()),
@@ -3872,6 +4027,143 @@ mod tests {
             max_attempts: 1,
         }
     }
+    async fn spawn_usage_error_server(
+        response_body: Value,
+        response_count: usize,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let response_body = response_body.to_string();
+        let handle = tokio::spawn(async move {
+            for _ in 0..response_count {
+                let (mut socket, _) = listener.accept().await.expect("accept test request");
+                let mut request = [0u8; 8192];
+                socket.read(&mut request).await.expect("read test request");
+                let response = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write test response");
+                socket.shutdown().await.expect("close test response");
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[test]
+    fn failed_attempt_usage_parses_nested_responses_payload() {
+        let error = ProxyError::TransformErrorWithBody {
+            message: "Responses upstream server_error: boom".to_string(),
+            body: json!({
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_failed",
+                    "model": "gpt-5.6",
+                    "status": "failed",
+                    "usage": {
+                        "input_tokens": 120,
+                        "output_tokens": 8,
+                        "input_tokens_details": { "cached_tokens": 20 }
+                    },
+                    "error": { "type": "server_error", "message": "boom" }
+                }
+            })
+            .to_string(),
+        };
+
+        let usage = parse_failed_attempt_usage(&error).expect("failed response usage");
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.cache_read_tokens, 20);
+        assert_eq!(usage.model.as_deref(), Some("gpt-5.6"));
+        assert_eq!(usage.message_id.as_deref(), Some("resp_failed"));
+    }
+
+    #[tokio::test]
+    async fn same_provider_retries_log_each_failed_attempt_usage() -> Result<(), AppError> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let response = json!({
+            "type": "error",
+            "error": { "type": "overloaded_error", "message": "retry later" },
+            "id": "msg_failed",
+            "model": "claude-test",
+            "usage": { "input_tokens": 11, "output_tokens": 2 }
+        });
+        let (base_url, server) = spawn_usage_error_server(response, 2).await;
+        let mut provider = test_provider_with_type(None);
+        provider.settings_config = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": base_url,
+                "ANTHROPIC_AUTH_TOKEN": "test-key"
+            }
+        });
+        let forwarder = test_forwarder(Duration::from_secs(5), Duration::from_secs(5));
+        let adapter = get_adapter(&AppType::Claude).expect("Claude adapter");
+        let mut permit = ProviderAttemptPermit::new(
+            forwarder.router.clone(),
+            &provider.id,
+            AppType::Claude.as_str(),
+            false,
+        );
+        let result = forwarder
+            .execute_provider_slot(
+                &AppType::Claude,
+                http::Method::POST,
+                "/v1/messages",
+                &json!({
+                    "model": "claude-test",
+                    "stream": false,
+                    "max_tokens": 8,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                }),
+                &HeaderMap::new(),
+                &Extensions::new(),
+                &provider,
+                adapter.as_ref(),
+                ProviderRetryPolicy {
+                    retry_count: 1,
+                    per_attempt_timeout_seconds: 5,
+                    retry_wait_seconds: 0,
+                    unlimited_retries: false,
+                },
+                &mut permit,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ProviderSlotFailure {
+                error: ProxyError::UpstreamError { status: 503, .. },
+                ..
+            })
+        ));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("same-provider retry did not issue two requests")
+            .expect("test server completed");
+
+        let conn = crate::database::lock_conn!(forwarder.db.conn);
+        let totals: (i64, i64, i64, f64) = conn.query_row(
+            "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens),
+                    SUM(CAST(total_cost_usd AS REAL))
+             FROM proxy_request_logs
+             WHERE request_id LIKE 'provider-attempt:%'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(totals, (2, 22, 4, 0.0));
+        Ok(())
+    }
+
     #[test]
     fn finite_provider_attempt_indices_match_retry_count() {
         let policy = crate::provider::ProviderRetryPolicy {
@@ -4591,7 +4883,8 @@ mod tests {
         );
         assert!(matches!(
             inspect_responses_start_event(failed),
-            Some(Err(ProxyError::TransformError(message))) if message.contains("boom")
+            Some(Err(ProxyError::TransformErrorWithBody { message, body }))
+                if message.contains("boom") && body.contains("response.failed")
         ));
 
         let delta = concat!(
@@ -4618,9 +4911,11 @@ mod tests {
         let failed = inspect_responses_json_document(
             r#"{"status":"failed","error":{"message":"backend unavailable"}}"#,
         );
-        assert!(
-            matches!(failed, Some(Err(ProxyError::TransformError(message))) if message.contains("backend unavailable"))
-        );
+        assert!(matches!(
+            failed,
+            Some(Err(ProxyError::TransformErrorWithBody { message, body }))
+                if message.contains("backend unavailable") && body.contains("\"status\":\"failed\"")
+        ));
     }
 
     #[test]

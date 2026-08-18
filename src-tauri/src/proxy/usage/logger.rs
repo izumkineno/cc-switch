@@ -253,9 +253,9 @@ impl<'a> UsageLogger<'a> {
         .map_err(|error| AppError::Database(format!("查询 usage request_id 失败: {error}")))
     }
 
-    /// 记录失败的请求
+    /// 记录失败的请求。
     ///
-    /// 用于记录无法从上游获取 usage 信息的失败请求
+    /// 用于记录无法从上游获取 usage 信息的失败请求。
     #[allow(dead_code, clippy::too_many_arguments)]
     pub fn log_error(
         &self,
@@ -268,32 +268,23 @@ impl<'a> UsageLogger<'a> {
         latency_ms: u64,
     ) -> Result<(), AppError> {
         let request_model = model.clone();
-        let log = RequestLog {
+        self.log_error_with_usage_context(
             request_id,
             provider_id,
             app_type,
             model,
             request_model,
-            // 错误行未经过计价，留空（回填的 has_usage 闸门也不会碰全 0 行）
-            pricing_model: String::new(),
-            usage: TokenUsage::default(),
-            cost: None,
-            latency_ms,
-            first_token_ms: None,
+            TokenUsage::default(),
             status_code,
-            error_message: Some(error_message),
-            session_id: None,
-            provider_type: None,
-            is_streaming: false,
-            cost_multiplier: "1.0".to_string(),
-        };
-
-        self.log_request(&log)
+            error_message,
+            latency_ms,
+            false,
+            None,
+            None,
+        )
     }
 
-    /// 记录失败的请求（带更多上下文信息）
-    ///
-    /// 相比 log_error，这个方法接受更多参数以提供完整的请求上下文
+    /// 记录失败的请求（带更多上下文信息）。
     #[allow(clippy::too_many_arguments)]
     pub fn log_error_with_context(
         &self,
@@ -309,15 +300,50 @@ impl<'a> UsageLogger<'a> {
         provider_type: Option<String>,
     ) -> Result<(), AppError> {
         let request_model = model.clone();
+        self.log_error_with_usage_context(
+            request_id,
+            provider_id,
+            app_type,
+            model,
+            request_model,
+            TokenUsage::default(),
+            status_code,
+            error_message,
+            latency_ms,
+            is_streaming,
+            session_id,
+            provider_type,
+        )
+    }
+
+    /// 记录已消耗 token 的失败上游尝试。
+    ///
+    /// 失败尝试保留 token 以反映真实消耗，但所有成本字段固定为 0。历史成本回填
+    /// 也只处理 2xx 行，不能在后续获得定价时把失败尝试改成计费记录。
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_error_with_usage_context(
+        &self,
+        request_id: String,
+        provider_id: String,
+        app_type: String,
+        model: String,
+        request_model: String,
+        usage: TokenUsage,
+        status_code: u16,
+        error_message: String,
+        latency_ms: u64,
+        is_streaming: bool,
+        session_id: Option<String>,
+        provider_type: Option<String>,
+    ) -> Result<(), AppError> {
         let log = RequestLog {
             request_id,
             provider_id,
             app_type,
             model,
             request_model,
-            // 错误行未经过计价，留空（回填的 has_usage 闸门也不会碰全 0 行）
             pricing_model: String::new(),
-            usage: TokenUsage::default(),
+            usage,
             cost: None,
             latency_ms,
             first_token_ms: None,

@@ -56,7 +56,7 @@ pub fn map_proxy_error_to_status(error: &ProxyError) -> u16 {
         ProxyError::DatabaseError(_) => 500,
 
         // 转换错误：422 Unprocessable Entity
-        ProxyError::TransformError(_) => 422,
+        ProxyError::TransformError(_) | ProxyError::TransformErrorWithBody { .. } => 422,
 
         // 其他未知错误：500 Internal Server Error
         _ => 500,
@@ -82,6 +82,9 @@ pub fn get_error_message(error: &ProxyError) -> String {
         ProxyError::ProviderUnhealthy(msg) => format!("Provider 不健康: {msg}"),
         ProxyError::DatabaseError(msg) => format!("数据库错误: {msg}"),
         ProxyError::TransformError(msg) => format!("请求/响应转换错误: {msg}"),
+        ProxyError::TransformErrorWithBody { message, .. } => {
+            format!("请求/响应转换错误: {message}")
+        }
         _ => error.to_string(),
     }
 }
@@ -136,6 +139,13 @@ mod tests {
             422
         );
         assert_eq!(
+            map_proxy_error_to_status(&ProxyError::TransformErrorWithBody {
+                message: "upstream failed".to_string(),
+                body: r#"{"secret":"must-not-leak"}"#.to_string(),
+            }),
+            422
+        );
+        assert_eq!(
             map_proxy_error_to_status(&ProxyError::StreamIdleTimeout(30)),
             504
         );
@@ -151,5 +161,16 @@ mod tests {
         assert!(msg.contains("上游错误"));
         assert!(msg.contains("500"));
         assert!(msg.contains("Internal Server Error"));
+    }
+    #[test]
+    fn transform_error_usage_body_is_not_exposed_in_messages() {
+        let error = ProxyError::TransformErrorWithBody {
+            message: "upstream failed".to_string(),
+            body: r#"{"secret":"must-not-leak"}"#.to_string(),
+        };
+        let message = get_error_message(&error);
+        assert!(message.contains("upstream failed"));
+        assert!(!message.contains("must-not-leak"));
+        assert!(!error.to_string().contains("must-not-leak"));
     }
 }

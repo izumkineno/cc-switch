@@ -1826,6 +1826,8 @@ impl Database {
                         data_source, pricing_model, input_token_semantics
              FROM proxy_request_logs
              WHERE CAST(total_cost_usd AS REAL) <= 0
+               AND status_code >= 200
+               AND status_code < 300
                AND (input_tokens > 0 OR output_tokens > 0
                     OR cache_read_tokens > 0 OR cache_creation_tokens > 0)";
 
@@ -1882,8 +1884,9 @@ impl Database {
             || log.output_tokens > 0
             || log.cache_read_tokens > 0
             || log.cache_creation_tokens > 0;
+        let is_success = (200..300).contains(&log.status_code);
 
-        if has_cost || !has_usage {
+        if has_cost || !has_usage || !is_success {
             return Ok(false);
         }
 
@@ -2922,6 +2925,59 @@ mod tests {
         )?;
         assert_eq!(total_cost, "0.600000");
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_backfill_never_prices_failed_usage_rows() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO model_pricing (
+                    model_id, display_name, input_cost_per_million, output_cost_per_million
+                 ) VALUES ('failed-attempt-model', 'Failed Attempt Model', '1', '2')",
+                [],
+            )?;
+            insert_usage_log(
+                &conn,
+                "failed-attempt-cost",
+                "codex",
+                "provider-1",
+                "failed-attempt-model",
+                "proxy",
+                1000,
+                1_000_000,
+                100,
+                0,
+                0,
+                503,
+                "0",
+            )?;
+        }
+
+        assert_eq!(db.backfill_missing_usage_costs()?, 0);
+        assert_eq!(
+            db.backfill_missing_usage_costs_for_model("failed-attempt-model")?,
+            0
+        );
+
+        let conn = lock_conn!(db.conn);
+        let costs: (String, String, String) = conn.query_row(
+            "SELECT input_cost_usd, output_cost_usd, total_cost_usd
+             FROM proxy_request_logs WHERE request_id = 'failed-attempt-cost'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(costs, ("0".to_string(), "0".to_string(), "0".to_string()));
+        drop(conn);
+
+        let summary = db.get_usage_summary(None, None, Some("codex"), None, None)?;
+        assert_eq!(summary.total_requests, 1);
+        assert_eq!(summary.total_input_tokens, 1_000_000);
+        assert_eq!(summary.total_output_tokens, 100);
+        assert_eq!(summary.total_cost, "0.000000");
+        assert_eq!(summary.success_rate, 0.0);
         Ok(())
     }
 

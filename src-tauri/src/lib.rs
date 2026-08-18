@@ -1130,6 +1130,8 @@ pub fn run() {
             );
             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
             app.manage(app_state);
+            app.manage(commands::ModelTestState::default());
+
 
             // 初始化 SkillService
             let skill_service = SkillService::new();
@@ -1472,6 +1474,11 @@ pub fn run() {
             // model list fetch (OpenAI-compatible /v1/models)
             commands::fetch_models_for_config,
             commands::get_opencode_models,
+            // Direct provider model tests
+            commands::refresh_provider_model_candidates,
+            commands::start_provider_model_test,
+            commands::get_provider_model_test_result,
+            commands::cancel_provider_model_test,
             // ours: endpoint speed test + custom endpoint management
             commands::test_api_endpoints,
             commands::get_custom_endpoints,
@@ -1654,6 +1661,7 @@ pub fn run() {
             commands::set_global_proxy_url,
             commands::test_proxy_url,
             commands::get_upstream_proxy_status,
+            commands::set_upstream_proxy_enabled,
             commands::scan_local_proxies,
             // Window theme control
             commands::set_window_theme,

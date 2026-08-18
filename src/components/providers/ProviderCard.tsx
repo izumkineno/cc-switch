@@ -31,6 +31,7 @@ import {
   extractCodexExperimentalBearerToken,
 } from "@/utils/providerConfigUtils";
 import { resolveManagedAccountId } from "@/lib/authBinding";
+import { isProviderModelTestEligible } from "@/utils/providerModelCandidates";
 import {
   resolveCodexOfficialIdentity,
   supportsOfficialProxyTakeover,
@@ -65,8 +66,10 @@ interface ProviderCardProps {
   onOpenWebsite: (url: string) => void;
   onDuplicate: (provider: Provider) => void;
   onTest?: (provider: Provider) => void;
+  onModelTest?: (provider: Provider) => void;
   onOpenTerminal?: (provider: Provider) => void;
   isTesting?: boolean;
+  isModelTesting?: boolean;
   isProxyRunning: boolean;
   isProxyTakeover?: boolean; // 代理接管模式（Live配置已被接管，切换为热切换）
   dragHandleProps?: DragHandleProps;
@@ -182,8 +185,10 @@ export function ProviderCard({
   onOpenWebsite,
   onDuplicate,
   onTest,
+  onModelTest,
   onOpenTerminal,
   isTesting,
+  isModelTesting,
   isProxyRunning,
   isProxyTakeover = false,
   dragHandleProps,
@@ -686,6 +691,7 @@ export function ProviderCard({
               isCurrent={isCurrent}
               isInConfig={isInConfig}
               isTesting={isTesting}
+              isModelTesting={isModelTesting}
               isProxyTakeover={isProxyTakeover}
               isOfficialBlockedByProxy={isOfficialBlockedByProxy}
               isReadOnly={isHermesReadOnly}
@@ -701,6 +707,11 @@ export function ProviderCard({
                 // 官方是原生 1P 模式，根本不在请求路径上）。
                 onTest && provider.category !== "official"
                   ? () => onTest(provider)
+                  : undefined
+              }
+              onModelTest={
+                onModelTest && isProviderModelTestEligible(appId, provider)
+                  ? () => onModelTest(provider)
                   : undefined
               }
               onConfigureUsage={

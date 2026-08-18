@@ -5,6 +5,7 @@ import {
   ChevronDown,
   Copy,
   Edit,
+  FlaskConical,
   Loader2,
   Minus,
   Play,
@@ -30,18 +31,19 @@ interface OpenClawDefaultModelOption {
   id: string;
   name?: string;
 }
-
 interface ProviderActionsProps {
   appId?: AppId;
   isCurrent: boolean;
   isInConfig?: boolean;
   isTesting?: boolean;
+  isModelTesting?: boolean;
   isProxyTakeover?: boolean;
   isOmo?: boolean;
   onSwitch: () => void;
   onEdit: () => void;
   onDuplicate?: () => void;
   onTest?: () => void;
+  onModelTest?: () => void;
   onConfigureUsage?: () => void;
   onDelete: () => void;
   onRemoveFromConfig?: () => void;
@@ -78,12 +80,14 @@ export function ProviderActions({
   isCurrent,
   isInConfig = false,
   isTesting,
+  isModelTesting,
   isProxyTakeover = false,
   isOmo = false,
   onSwitch,
   onEdit,
   onDuplicate,
   onTest,
+  onModelTest,
   onConfigureUsage,
   onDelete,
   onRemoveFromConfig,
@@ -429,6 +433,28 @@ export function ProviderActions({
             <Activity className="h-4 w-4" />
           )}
         </Button>
+
+        {onModelTest && (
+          <Button
+            size="icon"
+            variant="ghost"
+            onClick={onModelTest}
+            disabled={isModelTesting}
+            title={t("provider.modelTest.action", {
+              defaultValue: "Test model",
+            })}
+            aria-label={t("provider.modelTest.action", {
+              defaultValue: "Test model",
+            })}
+            className={iconButtonClass}
+          >
+            {isModelTesting ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <FlaskConical className="h-4 w-4" />
+            )}
+          </Button>
+        )}
 
         <Button
           size="icon"
