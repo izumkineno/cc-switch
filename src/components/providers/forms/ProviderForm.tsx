@@ -137,7 +137,7 @@ import { HERMES_DEFAULT_CONFIG } from "./hooks/useHermesFormState";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { useOpenClawLiveProviderIds } from "@/hooks/useOpenClaw";
 import { useHermesLiveProviderIds } from "@/hooks/useHermes";
-import { CODEX_OFFICIAL_PROVIDER_ID } from "@/utils/providerCapabilities";
+import { resolveCodexOfficialIdentity } from "@/utils/providerCapabilities";
 
 type PresetEntry = {
   id: string;
@@ -186,9 +186,9 @@ export const normalizeCodexCatalogModelsForSave = (
     );
 
     const baseInstructions = item.baseInstructions?.trim();
-    const reasoningLevels = item.reasoningLevels?.filter(
-      (level) => typeof level === "string" && level.trim(),
-    );
+    const reasoningLevels = item.reasoningLevels
+      ?.filter((level) => typeof level === "string" && level.trim())
+      .map((level) => level.trim());
     const defaultReasoningLevel = item.defaultReasoningLevel?.trim();
 
     normalized.push({
@@ -314,24 +314,18 @@ function ProviderFormFull({
 
   const { t } = useTranslation();
   const isEditMode = Boolean(initialData);
-  const isCodexNativeLoginProvider =
-    appId === "codex" && providerId === CODEX_OFFICIAL_PROVIDER_ID;
-  const startsAsLegacyUnboundCodexOfficial =
-    appId === "codex" &&
-    isEditMode &&
-    providerId !== CODEX_OFFICIAL_PROVIDER_ID &&
-    initialData?.category === "official" &&
-    !resolveManagedAccountId(initialData.meta, "codex_oauth")?.trim();
-  const { data: codexNativeLoginProviderExists = true } = useQuery({
-    queryKey: ["providers", "codex", "native-login-exists"],
-    enabled: appId === "codex" && !isCodexNativeLoginProvider,
-    queryFn: async () => {
-      const providers = await providersApi.getAll("codex");
-      return Boolean(providers[CODEX_OFFICIAL_PROVIDER_ID]);
-    },
-  });
-  const canCreateCodexNativeLoginProvider =
-    appId === "codex" && !isEditMode && !codexNativeLoginProviderExists;
+  const initialCodexOfficialIdentity =
+    appId === "codex" && initialData
+      ? resolveCodexOfficialIdentity(appId, {
+          id: providerId ?? "",
+          category: initialData.category,
+          meta: initialData.meta,
+          settingsConfig: initialData.settingsConfig ?? {},
+        })
+      : null;
+  const hasExistingCodexOfficialIdentity =
+    initialCodexOfficialIdentity !== null &&
+    initialCodexOfficialIdentity !== "api_key";
   const queryClient = useQueryClient();
   const { data: settingsData } = useSettingsQuery();
   const showCommonConfigNotice =
@@ -405,7 +399,9 @@ function ProviderFormFull({
     appId,
     selectedPresetId,
     isEditMode,
-    initialCategory: initialData?.category,
+    initialCategory:
+      initialData?.category ??
+      (hasExistingCodexOfficialIdentity ? "official" : undefined),
   });
   const isOmoCategory = appId === "opencode" && category === "omo";
   const isOmoSlimCategory = appId === "opencode" && category === "omo-slim";
@@ -441,6 +437,7 @@ function ProviderFormFull({
     setSelectedCodexAccountId(
       resolveManagedAccountId(initialData?.meta, "codex_oauth"),
     );
+    setHasValidCodexOfficialSelection(true);
     setCodexFastMode(initialData?.meta?.codexFastMode ?? false);
     setCodexChatReasoning(initialData?.meta?.codexChatReasoning ?? {});
     setPromptCacheRouting(initialData?.meta?.promptCacheRouting ?? "auto");
@@ -625,10 +622,8 @@ function ProviderFormFull({
   const [selectedCodexAccountId, setSelectedCodexAccountId] = useState<
     string | null
   >(() => resolveManagedAccountId(initialData?.meta, "codex_oauth"));
-  const [
-    hasExplicitCodexOfficialSelection,
-    setHasExplicitCodexOfficialSelection,
-  ] = useState(isEditMode && !startsAsLegacyUnboundCodexOfficial);
+  const [hasValidCodexOfficialSelection, setHasValidCodexOfficialSelection] =
+    useState(true);
   const [selectedXaiAccountId, setSelectedXaiAccountId] = useState<
     string | null
   >(() => resolveManagedAccountId(initialData?.meta, "xai_oauth"));
@@ -836,23 +831,19 @@ function ProviderFormFull({
   const isXaiOauthProvider =
     (appId === "claude" || appId === "codex") &&
     (presetProviderType === "xai_oauth" || initialProviderType === "xai_oauth");
+  const wasCodexOfficialManagedOauthBound =
+    appId === "codex" &&
+    Boolean(resolveManagedAccountId(initialData?.meta, "codex_oauth"));
   const isCodexOfficialProvider =
     appId === "codex" &&
-    (category === "official" ||
+    (hasExistingCodexOfficialIdentity ||
+      wasCodexOfficialManagedOauthBound ||
       (presetProviderType === "codex_oauth" &&
         selectedPresetEntry?.preset.category === "official"));
   const isCodexOfficialManagedOauthBound =
     isCodexOfficialProvider && Boolean(selectedCodexAccountId);
-  const wasCodexOfficialManagedOauthBound =
-    appId === "codex" &&
-    initialData?.category === "official" &&
-    Boolean(resolveManagedAccountId(initialData?.meta, "codex_oauth"));
-  const canSelectCodexNativeLogin =
-    isCodexNativeLoginProvider ||
-    canCreateCodexNativeLoginProvider ||
-    (isEditMode && isCodexOfficialProvider && !codexNativeLoginProviderExists);
   const requiresExplicitCodexOfficialSelection =
-    isCodexOfficialProvider && !hasExplicitCodexOfficialSelection;
+    isCodexOfficialProvider && !hasValidCodexOfficialSelection;
   const requiresCodexOauthLogin =
     isClaudeCodexOauthProvider || isCodexOfficialManagedOauthBound;
 
@@ -1557,17 +1548,16 @@ function ProviderFormFull({
 
     if (appId === "codex") {
       try {
-        const shouldStripManagedCodexAuth =
-          category === "official" &&
-          (isCodexOfficialManagedOauthBound ||
-            wasCodexOfficialManagedOauthBound);
-        const authJson = shouldStripManagedCodexAuth
+        const shouldStripCodexOfficialAuth =
+          isCodexOfficialManagedOauthBound || wasCodexOfficialManagedOauthBound;
+        const authJson = shouldStripCodexOfficialAuth
           ? {}
           : JSON.parse(codexAuth);
+        const codexConfigForSave = codexConfig ?? "";
         let normalizedCodexConfig =
-          category !== "official" && (codexConfig ?? "").trim()
-            ? setCodexWireApi(codexConfig ?? "", "responses")
-            : (codexConfig ?? "");
+          category !== "official" && codexConfigForSave.trim()
+            ? setCodexWireApi(codexConfigForSave, "responses")
+            : codexConfigForSave;
         // 模型映射与「路由接管」解耦：对所有非官方供应商，填了就持久化
         //（Chat 生成兼容路由、原生 Responses 生成 model-catalogs.json），
         // 留空归一化为 [] 即不写。后端只看 modelCatalog.models 是否非空。
@@ -1650,10 +1640,7 @@ function ProviderFormFull({
     };
 
     if (isCodexOfficialProvider) {
-      payload.codexNativeLoginSelected =
-        !selectedCodexAccountId &&
-        hasExplicitCodexOfficialSelection &&
-        canSelectCodexNativeLogin;
+      payload.presetCategory = "official";
     }
 
     if (appId === "opencode") {
@@ -2521,10 +2508,10 @@ function ProviderFormFull({
               selectedCodexAccountId={selectedCodexAccountId}
               onCodexAccountSelect={setSelectedCodexAccountId}
               onCodexAuthSelectionConfirmed={() =>
-                setHasExplicitCodexOfficialSelection(true)
+                setHasValidCodexOfficialSelection(true)
               }
               onCodexAuthSelectionInvalidated={() =>
-                setHasExplicitCodexOfficialSelection(false)
+                setHasValidCodexOfficialSelection(false)
               }
               onManageAuthAccounts={onManageAuthAccounts}
               codexOauthSelectionLabel={t("codexOauth.signInMethod")}
@@ -2532,10 +2519,8 @@ function ProviderFormFull({
               codexOauthNoneOptionDescription={t(
                 "codex.followCodexLoginDescription",
               )}
-              codexOauthAllowUnboundSelection={canSelectCodexNativeLogin}
-              codexOauthAllowUnboundSelectionWithoutStatus={
-                canSelectCodexNativeLogin
-              }
+              codexOauthAllowUnboundSelection
+              codexOauthAllowUnboundSelectionWithoutStatus
               codexOauthRequireExplicitSelection={
                 requiresExplicitCodexOfficialSelection
               }
@@ -2951,6 +2936,4 @@ export type ProviderFormValues = ProviderFormData & {
   meta?: ProviderMeta;
   providerKey?: string; // OpenCode/OpenClaw: user-defined provider key
   suggestedDefaults?: OpenClawSuggestedDefaults; // OpenClaw: suggested default model configuration
-  /** Transient UI intent used to promote a legacy Codex Official row. */
-  codexNativeLoginSelected?: boolean;
 };
